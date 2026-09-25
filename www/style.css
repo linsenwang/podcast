@@ -1,0 +1,287 @@
+/* 极简播客客户端 —— 移动优先，深/浅两套配色
+ * data-theme 有两处会设置：index.html head 里的内联脚本（防首屏闪色）和
+ * app.js 的 applyTheme()。"auto" 已在 JS 里解析成 light/dark 再写进来，
+ * 所以 CSS 这边不用写媒体查询。
+ */
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel2: #1e222b;
+  --line: #272c37;
+  --fg: #e7eaf0;
+  --dim: #949cad;
+  --accent: #4f8cff;
+  --accent-dim: #2f5ea8;
+  --pressed: #2b3140;      /* 按钮按下时 */
+  --track: #2b3140;        /* 进度条槽 */
+  --playing: #16233c;      /* 正在播的那行 */
+  --sel: #1b2740;          /* 选中态底色（chip、勾、倍速） */
+  --done-off: #3f4657;     /* 未标完播的勾 */
+  --on-accent: #fff;       /* 蓝底上的图标 */
+  --accent-active: #3d78e8;
+}
+
+:root[data-theme="light"] {
+  --bg: #f4f5f7;
+  --panel: #fff;
+  --panel2: #edeff3;
+  --line: #dcdfe6;
+  --fg: #101318;
+  --dim: #6a7280;
+  --accent: #2f6fe4;
+  --accent-dim: #a3c0f3;
+  --pressed: #e2e6ee;
+  --track: #e0e4ea;
+  --playing: #e3ecff;
+  --sel: #e3ecff;
+  --done-off: #c3c9d4;
+  --on-accent: #fff;
+  --accent-active: #2a62cf;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior-y: none;
+}
+
+button { font: inherit; color: inherit; cursor: pointer; }
+
+/* ---------- 顶栏 ---------- */
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: calc(10px + env(safe-area-inset-top)) 14px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.top h1 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: .5px; }
+.top-right { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.status { font-size: 12px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.icon-btn {
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  border-radius: 9px;
+  padding: 6px;
+  color: var(--fg);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .12s;
+}
+.icon-btn:active { background: var(--pressed); }
+.icon-btn[disabled] { opacity: .45; cursor: default; }
+
+/* 图标统一用 CSS mask，颜色跟着 currentColor 走，SVG 本身只提供形状 */
+.ico {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  background-color: currentColor;
+  -webkit-mask: var(--ico) center / contain no-repeat;
+  mask: var(--ico) center / contain no-repeat;
+}
+.ico-play { width: 22px; height: 22px; --ico: url(icons/play_arrow.svg); }
+.ico-pause { width: 22px; height: 22px; --ico: url(icons/pause.svg); }
+.ico-refresh { --ico: url(icons/refresh.svg); }
+.ico-close { --ico: url(icons/close.svg); }
+.ico-check { width: 15px; height: 15px; --ico: url(icons/check.svg); }
+.ico-replay { --ico: url(icons/replay_10.svg); }
+.ico-forward { --ico: url(icons/forward_30.svg); }
+.ico-add { width: 16px; height: 16px; --ico: url(icons/add.svg); }
+/* 主题按钮按当前模式换图标：auto=自动、light=太阳、dark=月亮 */
+.ico-auto { --ico: url(icons/brightness_auto.svg); }
+.ico-light { --ico: url(icons/light_mode.svg); }
+.ico-dark { --ico: url(icons/dark_mode.svg); }
+
+/* ---------- 过滤栏 ---------- */
+.toolbar {
+  display: flex;
+  gap: 8px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.toolbar select {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+}
+.chip {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  border-radius: 999px;
+  padding: 6px 11px;
+  font-size: 12.5px;
+  color: var(--dim);
+}
+.chip.on { border-color: var(--accent); color: var(--fg); background: var(--sel); }
+
+/* ---------- 单集列表 ---------- */
+.list { flex: 1 1 auto; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+
+.ep {
+  display: grid;
+  grid-template-columns: 52px 1fr auto;
+  gap: 11px;
+  align-items: center;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.ep.playing { background: var(--playing); }
+.ep-img {
+  width: 52px;
+  height: 52px;
+  border-radius: 8px;
+  background: var(--panel2);
+  object-fit: cover;
+  display: block;
+}
+.ep-main { min-width: 0; }
+.ep-meta {
+  font-size: 11.5px;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ep-title {
+  font-size: 14px;
+  margin-top: 2px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.ep.done .ep-title { color: var(--dim); }
+.ep-bar { height: 3px; background: var(--track); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+.ep-bar > i { display: block; height: 100%; background: var(--accent); }
+
+.ep-done {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--done-off);
+  border-radius: 50%;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.ep-done[aria-pressed="true"] { border-color: var(--accent-dim); color: var(--accent); background: var(--sel); }
+
+.sentinel { height: 1px; }
+
+.empty { padding: 40px 20px; text-align: center; color: var(--dim); font-size: 13.5px; }
+
+/* ---------- 播放器 ---------- */
+.player {
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
+}
+.pl-top { display: grid; grid-template-columns: 40px 1fr auto; gap: 10px; align-items: center; }
+.pl-img { width: 40px; height: 40px; border-radius: 7px; background: var(--panel2); object-fit: cover; display: block; }
+.pl-info { min-width: 0; }
+.pl-title { font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pl-sub { font-size: 11.5px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.pl-seek { width: 100%; margin: 9px 0 4px; accent-color: var(--accent); }
+
+.pl-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.pl-time { font-size: 11.5px; color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pl-btns { display: flex; align-items: center; gap: 8px; }
+
+.play-btn {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent);
+  color: var(--on-accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.play-btn:active { background: var(--accent-active); }
+
+.speed-btn {
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  border-radius: 9px;
+  padding: 6px 9px;
+  font-size: 12.5px;
+  min-width: 46px;
+  font-variant-numeric: tabular-nums;
+}
+
+.speed-row { display: flex; gap: 6px; margin-top: 9px; overflow-x: auto; }
+.speed-row button {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 12.5px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.speed-row button.on { border-color: var(--accent); color: var(--fg); background: var(--sel); }
+/* 行尾的 + ：进入倍速预设编辑 */
+.speed-row .speed-add {
+  padding: 5px 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ---------- 倍速预设编辑 ---------- */
+.speed-edit { margin-top: 9px; border-top: 1px dashed var(--line); padding-top: 9px; }
+.speed-edit-hint { font-size: 11.5px; color: var(--dim); margin-bottom: 6px; }
+.speed-input {
+  width: 100%;
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.speed-input:focus { outline: none; border-color: var(--accent); }
+.speed-edit-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.speed-err { flex: 1 1 auto; color: #ff7a7a; font-size: 11.5px; }
+:root[data-theme="light"] .speed-err { color: #cc2b2b; }
+.speed-edit-row button { padding: 6px 14px; font-size: 13px; }
+
+/* ---------- 桌面/平板 ---------- */
+@media (min-width: 720px) {
+  body { max-width: 760px; margin: 0 auto; border-left: 1px solid var(--line); border-right: 1px solid var(--line); }
+}

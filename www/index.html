@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- bilibili 图床对"非 bilibili 的 Referer"直接 403，不发 Referer 才给图 -->
+<meta name="referrer" content="no-referrer">
+<title>播客</title>
+<meta name="theme-color" content="#0f1115">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="播客">
+<script>
+// 先定主题再加载样式表，避免浅色模式下先闪一下深色。
+// 这段必须内联在 head 里：app.js 在 body 末尾，那时已经画出来了。
+(function () {
+  try {
+    var s = JSON.parse(localStorage.getItem('podcast.settings') || '{}');
+    var t = s.theme || 'auto';
+    if (t === 'auto') t = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    document.documentElement.dataset.theme = t;
+  } catch (e) { /* 读不到就按深色画，app.js 起来后会纠正 */ }
+})();
+</script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="top">
+  <h1>播客</h1>
+  <div class="top-right">
+    <span id="status" class="status"></span>
+    <button id="theme" class="icon-btn" title="主题"><span id="themeIco" class="ico ico-auto"></span></button>
+    <button id="refresh" class="icon-btn" title="刷新全部订阅" aria-label="刷新"><span class="ico ico-refresh"></span></button>
+  </div>
+</header>
+
+<div class="toolbar">
+  <select id="feedSel" aria-label="选择订阅源"></select>
+  <button id="sortBtn" class="chip" aria-label="排序方式"></button>
+  <button id="hideBtn" class="chip" role="switch" aria-checked="true">隐藏已完播</button>
+</div>
+
+<main id="list" class="list" aria-live="polite">
+  <div id="sentinel" class="sentinel"></div>
+</main>
+<div id="empty" class="empty" hidden></div>
+
+<footer id="player" class="player" hidden>
+  <div class="pl-top">
+    <img id="plImg" class="pl-img" alt="" referrerpolicy="no-referrer">
+    <div class="pl-info">
+      <div id="plTitle" class="pl-title"></div>
+      <div id="plSub" class="pl-sub"></div>
+    </div>
+    <button id="plClose" class="icon-btn" title="关闭播放器" aria-label="关闭"><span class="ico ico-close"></span></button>
+  </div>
+
+  <input id="plSeek" class="pl-seek" type="range" min="0" max="1000" step="1" value="0" aria-label="播放进度">
+
+  <div class="pl-row">
+    <span id="plTime" class="pl-time">0:00 / 0:00</span>
+    <div class="pl-btns">
+      <button id="plBack" class="icon-btn" title="后退 10 秒" aria-label="后退 10 秒"><span class="ico ico-replay"></span></button>
+      <button id="plPlay" class="play-btn" title="播放/暂停" aria-label="播放"><span id="plIcon" class="ico ico-play"></span></button>
+      <button id="plFwd" class="icon-btn" title="前进 30 秒" aria-label="前进 30 秒"><span class="ico ico-forward"></span></button>
+      <button id="plSpeed" class="speed-btn" title="倍速" aria-label="播放倍速">1×</button>
+    </div>
+  </div>
+
+  <div id="speedRow" class="speed-row" hidden></div>
+
+  <div id="speedEdit" class="speed-edit" hidden>
+    <div class="speed-edit-hint">倍速预设（逗号分隔，0.5–4，最多 12 个）</div>
+    <input id="speedInput" class="speed-input" type="text" inputmode="decimal"
+           autocomplete="off" spellcheck="false" aria-label="倍速预设列表">
+    <div class="speed-edit-row">
+      <span id="speedErr" class="speed-err" role="alert"></span>
+      <button id="speedCancel" class="chip" type="button">取消</button>
+      <button id="speedSave" class="chip on" type="button">保存</button>
+    </div>
+  </div>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
