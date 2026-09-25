@@ -116,6 +116,9 @@ async function syncPush() {
       body: JSON.stringify(syncPayload()),
     });
     if (!res.ok) throw new Error('HTTP ' + res.status);
+    // 把 body 读完。不读（或 cancel 掉）的话，浏览器会把这条其实已经 201 成功的
+    // PUT 在网络面板里标成 net::ERR_ABORTED，排查问题时很误导。
+    await res.text();
     syncBroken = false;
   } catch (err) {
     markSyncBroken(err);
@@ -392,6 +395,7 @@ async function refresh(force) {
       const c = cached.get(f.id);
       return Object.assign({}, f, {
         fetchedAt: c ? c.fetchedAt : 0,
+        lastModified: c && c.lastModified ? c.lastModified : '',
         episodes: c && c.episodes ? c.episodes : [],
       });
     });
@@ -400,15 +404,31 @@ async function refresh(force) {
     render();
 
     const stale = feeds.filter((f) => force || Date.now() - f.fetchedAt > STALE_MS);
-    let done = 0, failed = 0;
-    await pool(stale, 4, async (f) => {
+    let done = 0, failed = 0, unchanged = 0;
+    // 并发 8：链路是 HTTP/2（tailscale serve 协商出来的），多路复用，
+    // 所以不受浏览器"单域名 6 连接"的限制，开高一点能明显缩短等待。
+    await pool(stale, 8, async (f) => {
       try {
-        const res = await fetch(f.url, { cache: 'no-store' });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        f.episodes = parseFeed(await res.text());
-        f.fetchedAt = Date.now();
-        f.error = '';
-        await dbPut({ id: f.id, fetchedAt: f.fetchedAt, episodes: f.episodes });
+        // feed 大部分时候没变，带上 If-Modified-Since 就能只收一个 304 ——
+        // 不但省掉整个体的下载，连 DOMParser 和重建对象都省了
+        const headers = {};
+        if (f.lastModified && f.episodes.length) headers['If-Modified-Since'] = f.lastModified;
+
+        const res = await fetch(f.url, { cache: 'no-store', headers: headers });
+        if (res.status === 304) {
+          f.fetchedAt = Date.now();
+          f.error = '';
+          unchanged++;
+        } else {
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          f.episodes = parseFeed(await res.text());
+          f.fetchedAt = Date.now();
+          f.lastModified = res.headers.get('Last-Modified') || f.lastModified || '';
+          f.error = '';
+        }
+        await dbPut({
+          id: f.id, fetchedAt: f.fetchedAt, lastModified: f.lastModified, episodes: f.episodes,
+        });
       } catch (err) {
         f.error = String((err && err.message) || err);
         failed++;
@@ -419,7 +439,9 @@ async function refresh(force) {
     pruneProgress();
     render();
     const stamp = new Date().toTimeString().slice(0, 5);
-    setStatus(failed ? stamp + ' 更新完成，' + failed + ' 个失败' : stamp + ' 已更新');
+    if (failed) setStatus(stamp + ' 更新完成，' + failed + ' 个失败');
+    else if (unchanged) setStatus(stamp + ' 已更新（' + unchanged + ' 个未变化）');
+    else setStatus(stamp + ' 已更新');
   } catch (err) {
     setStatus('离线：' + String((err && err.message) || err));
   } finally {
@@ -961,7 +983,11 @@ async function boot() {
     const cached = new Map((await dbGetAll()).map((r) => [r.id, r]));
     for (const f of feeds) {
       const c = cached.get(f.id);
-      if (c) { f.episodes = c.episodes || []; f.fetchedAt = c.fetchedAt || 0; }
+      if (c) {
+        f.episodes = c.episodes || [];
+        f.fetchedAt = c.fetchedAt || 0;
+        f.lastModified = c.lastModified || '';
+      }
     }
     syncFeedSelect();
     render();
