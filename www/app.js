@@ -10,6 +10,7 @@
 const FEED_BASE = new URL('feeds/', document.baseURI).href; // 同源反代前缀
 const INDEX_URL = FEED_BASE + 'podsync.opml';
 const SYNC_BASE = new URL('sync/', document.baseURI).href;  // nginx WebDAV 目录
+const THUMB_BASE = new URL('thumb', document.baseURI).href;  // 服务端缩略图接口
 const STALE_MS = 15 * 60 * 1000;   // 超过这个时间就重取单个 feed
 const PAGE_SIZE = 60;              // 列表分批渲染，避免一次塞几千个节点
 const DONE_RATIO = 0.98;           // 播到这里就算完播
@@ -24,6 +25,8 @@ const LS_SETTINGS = 'podcast.settings';
 const LS_PROGRESS = 'podcast.progress';
 const LS_DEVICE = 'podcast.device';
 const LS_SETTINGS_AT = 'podcast.settingsAt';
+const LS_SETTINGS_V = 'podcast.settingsV';
+const LS_LAMPORT = 'podcast.lamport';
 
 const $ = (id) => document.getElementById(id);
 const sentinel = $('sentinel');
@@ -40,7 +43,7 @@ function writeLS(key, val) {
 }
 
 let settings = Object.assign(
-  { hideFinished: true, sortDesc: true, feed: '', speed: 1, speeds: null, theme: 'auto' },
+  { hideFinished: true, sortDesc: true, feed: '', speed: 1, speeds: null, theme: 'auto', doneView: false },
   readLS(LS_SETTINGS, {})
 );
 // 兜住历史数据 / 手改坏的值
@@ -49,8 +52,9 @@ if (THEMES.indexOf(settings.theme) < 0) settings.theme = 'auto';
 if (!(settings.speed > 0)) settings.speed = 1;
 
 let progress = readLS(LS_PROGRESS, {}) || {};
-// 倍速预设的最后修改时间，用来和别的设备比谁新
+// 倍速预设的版本/时间：优先用逻辑版本（和进度用同一个时钟），时间只作老数据的兜底
 let settingsAt = Number(readLS(LS_SETTINGS_AT, 0)) || 0;
+let settingsV = Number(readLS(LS_SETTINGS_V, 0)) || 0;
 
 let lastSave = 0;
 // 播放中 timeupdate 很密，进度最多 5 秒落一次盘；落盘顺带把同步推送排上
@@ -59,6 +63,7 @@ function saveProgress(force) {
   if (!force && now - lastSave < 5000) return;
   lastSave = now;
   writeLS(LS_PROGRESS, progress);
+  writeLS(LS_LAMPORT, lamport);      // 逻辑时钟跟着进度一起落盘
   schedulePush(force ? 1500 : PUSH_EVERY);
 }
 function saveSettings() { writeLS(LS_SETTINGS, settings); }
@@ -67,9 +72,15 @@ function saveSettings() { writeLS(LS_SETTINGS, settings); }
  * 存储端是 nginx 的 WebDAV 目录 /sync/（见 podcast/nginx.conf）。
  * 每台设备只写自己那个文件（dev-xxxx.json），读的时候把别人的全拉下来合并，
  * 所以没有"谁把谁覆盖了"的问题。合并规则：
- *   · 单集进度：逐条比 u（该条最后修改时间），新的赢 —— "取消完播"这类回退也靠它传播
- *   · 倍速预设：整块比 settingsAt，新的赢
- * 乐观假设：各设备时钟差得不多，差太多就可能拿旧数据压掉新数据。
+ *   · 单集进度：逐条比逻辑版本 v，大的赢 —— 不按墙上时钟算
+ *   · 倍速预设：整块比逻辑版本 settingsV，同样按动作先后，老数据才退回比时间
+ *
+ * 为什么进度不能用时间：设备间时钟可能差十几分钟，而"动作的先后"才是真语义。
+ * 典型翻车：手机播完了一集（动作 5），但那次上传卡住没上去；电脑上那条更早的
+ * "未播"记录（动作 2）却因为电脑时钟快而被判成"更新"，完播就这么丢了。
+ * 改用 Lamport 逻辑时钟：本地每改一次进度 v+1；合并时把本地时钟推到见过的
+ * 最大版本之后，于是"后发生的动作"一定拿到更大的 v，跟时钟准不准无关。
+ * v 相同时（两台设备并发改同一条）再用设备标签 dv 定序，保证各设备算出同一个结果。
  */
 let deviceId = readLS(LS_DEVICE, null);
 if (typeof deviceId !== 'string' || !/^dev-[a-z0-9]+$/.test(deviceId)) {
@@ -77,6 +88,52 @@ if (typeof deviceId !== 'string' || !/^dev-[a-z0-9]+$/.test(deviceId)) {
   writeLS(LS_DEVICE, deviceId);
 }
 const DEVICE_FILE = deviceId + '.json';
+const DEV_TAG = deviceId.slice(-3);          // 版本相同时的确定性裁决依据
+
+let lamport = Number(readLS(LS_LAMPORT, 0)) || 0;
+
+function nextVersion() { return ++lamport; }
+
+// 合并时调用：把本地时钟推到所有见过的版本之后
+function bumpLamport(v) {
+  const n = Number(v) || 0;
+  if (n > lamport) lamport = n;
+}
+
+// 候选 remote 能不能盖掉 local：版本大的赢；版本相同用设备标签定序
+function versionWins(remote, local) {
+  if (!local) return true;
+  const rv = Number(remote.v) || 0, lv = Number(local.v) || 0;
+  if (rv !== lv) return rv > lv;
+  return String(remote.dv || '') > String(local.dv || '');
+}
+
+// 唯一的进度写入口：打上逻辑版本 + 设备标签，再更新墙上时钟（后者只用于展示）
+function touchProgress(id, patch) {
+  const pr = progress[id] || { p: 0, d: 0 };
+  if (patch) Object.assign(pr, patch);
+  pr.v = nextVersion();
+  pr.dv = DEV_TAG;
+  pr.u = Date.now();
+  progress[id] = pr;
+  return pr;
+}
+
+// 标记/取消完播。c 是"完播时间"，只在 0->1 那一次记下来，
+// 「最近完播」按它排序；取消完播时清掉，撤回后就不该再出现在那个列表里。
+function setFinished(id, on) {
+  // 必须写回 progress：条目还不存在时（手动点勾就是这条路径）只改局部对象会直接丢掉
+  const pr = progress[id] || (progress[id] = { p: 0, d: 0 });
+  if (on) {
+    if (pr.f !== 1) pr.c = Date.now();
+    pr.f = 1;
+  } else {
+    pr.f = 0;
+    pr.c = 0;
+    pr.p = 0;
+  }
+  return pr;
+}
 
 let pushing = false;
 let pulling = false;
@@ -87,10 +144,11 @@ let syncBroken = false;
 
 function syncPayload() {
   return {
-    v: 1,
+    v: 2,
     device: deviceId,
     at: Date.now(),
     settingsAt: settingsAt,
+    settingsV: settingsV,
     settings: { speed: settings.speed, speeds: settings.speeds },
     progress: progress,
   };
@@ -176,21 +234,31 @@ function mergeDocs(docs) {
     for (const id in d.progress) {
       const remote = d.progress[id];
       if (!remote || typeof remote !== 'object') continue;
+      bumpLamport(remote.v);                       // 见过就推进本地时钟
       const local = progress[id];
-      if (!local || (remote.u || 0) > (local.u || 0)) { progress[id] = remote; merged++; }
+      if (versionWins(remote, local)) { progress[id] = remote; merged++; }
     }
   }
+
+  // 设置块也按"动作"比：先比逻辑版本，两边都没有（老数据）才退回比时间
+  const rankOf = (v, at) => [Number(v) || 0, Number(at) || 0];
+  const rankGt = (a, b) => (a[0] !== b[0] ? a[0] > b[0] : a[1] > b[1]);
+  const mineRank = rankOf(settingsV, settingsAt);
 
   let best = null;
   for (const d of docs) {
     if (!d || !d.settings) continue;
-    const at = d.settingsAt || 0;
-    if (at <= settingsAt) continue;
-    if (!best || at > (best.settingsAt || 0)) best = d;
+    if (!rankGt(rankOf(d.settingsV, d.settingsAt), mineRank)) continue;
+    if (!best || rankGt(rankOf(d.settingsV, d.settingsAt), rankOf(best.settingsV, best.settingsAt))) {
+      best = d;
+    }
   }
   if (best) {
     settingsAt = best.settingsAt || 0;
+    settingsV = best.settingsV || 0;
+    bumpLamport(settingsV);          // 本地时钟跟上去，本地下次改一定"更晚"
     writeLS(LS_SETTINGS_AT, settingsAt);
+    writeLS(LS_SETTINGS_V, settingsV);
     if (best.settings.speed > 0) settings.speed = best.settings.speed;
     if (Array.isArray(best.settings.speeds) && best.settings.speeds.length) {
       settings.speeds = best.settings.speeds;
@@ -304,6 +372,16 @@ function imgUrl(u) {
   const s = toLocal(u);
   if (location.protocol === 'https:' && s.slice(0, 5) === 'http:') return 'https:' + s.slice(5);
   return s;
+}
+// 封面一律走服务端的缩略图接口（见 podcast/thumbs/）：原站大图动不动上百 KB，
+// 让客户端每打开一次列表就去拉一批，既慢又跟音频抢带宽。
+// 服务端抓一次、缩到长边 200px 落盘，之后所有设备都拿这张小图。
+function thumbUrl(u) {
+  const abs = imgUrl(u);
+  if (!abs) return '';
+  // 本来就在本站的（已经缩过的 / podsync 自己出的图）不必再绕一圈
+  if (abs.indexOf(location.origin + '/') === 0) return abs;
+  return THUMB_BASE + '?u=' + encodeURIComponent(abs);
 }
 function epId(feedId, ep) { return feedId + '/' + (ep.g || ep.u); }
 function isFinished(pr) {
@@ -467,20 +545,31 @@ function pruneProgress() {
 /* ================= 列表渲染 ================= */
 function visibleEpisodes() {
   const out = [];
+  const doneView = !!settings.doneView;
   for (const f of feeds) {
     if (settings.feed && settings.feed !== f.id) continue;
     for (const e of f.episodes) {
       const id = epId(f.id, e);
       const pr = progress[id] || null;
       const fin = isFinished(pr);
-      if (settings.hideFinished && fin) continue;
+      if (doneView) {
+        if (!fin) continue;                  // 「最近完播」只看完播过的
+      } else if (settings.hideFinished && fin) {
+        continue;
+      }
       out.push({
         id: id, e: e, f: f, pr: pr, fin: fin,
+        c: (pr && pr.c) || 0,
         pct: pr && pr.d > 0 ? Math.min(100, (pr.p / pr.d) * 100) : 0,
       });
     }
   }
-  out.sort((a, b) => (settings.sortDesc ? b.e.p - a.e.p : a.e.p - b.e.p));
+  if (doneView) {
+    // 按"完播时间"倒序 —— 这个视图的用途就是点错了能立刻翻到、撤回
+    out.sort((a, b) => (b.c - a.c) || (b.e.p - a.e.p));
+  } else {
+    out.sort((a, b) => (settings.sortDesc ? b.e.p - a.e.p : a.e.p - b.e.p));
+  }
   return out;
 }
 
@@ -490,15 +579,17 @@ function rowEl(it) {
   row.className = 'ep' + (it.fin ? ' done' : '') + (playing ? ' playing' : '');
   row.dataset.id = it.id;
 
-  // 封面用 <img referrerpolicy="no-referrer">：bilibili 图床对"非 bilibili 的 Referer"
-  // 直接 403，而这个属性是唯一能保证单个子资源不带 Referer 的手段
+  // 封面走服务端缩略图（见 podcast/thumbs/）：原站大图一次都不该由客户端去拉 ——
+  // 又慢又跟音频抢带宽。referrerpolicy 保留作兜底：将来若直接回退原图，
+  // bilibili 图床对"非 bilibili 的 Referer"会 403，不带 Referer 才给图。
   const cover = document.createElement('img');
   cover.className = 'ep-img';
   cover.alt = '';
   cover.loading = 'lazy';
   cover.decoding = 'async';
   cover.referrerPolicy = 'no-referrer';
-  const coverSrc = imgUrl(it.e.i);
+  cover.fetchPriority = 'low';        // 永远别跟音频抢带宽
+  const coverSrc = thumbUrl(it.e.i);
   if (coverSrc) cover.src = coverSrc;
   cover.addEventListener('error', () => cover.removeAttribute('src'));
 
@@ -507,7 +598,10 @@ function rowEl(it) {
 
   const meta = document.createElement('div');
   meta.className = 'ep-meta';
-  meta.textContent = it.f.title + ' · ' + fmtDate(it.e.p) + (it.e.d ? ' · ' + fmtDur(it.e.d) : '');
+  // 「最近完播」视图里显示完播时间 —— 列表就是按它排的
+  meta.textContent = it.f.title + ' · '
+    + (settings.doneView ? '完播于 ' + fmtDate(it.c) : fmtDate(it.e.p))
+    + (it.e.d ? ' · ' + fmtDur(it.e.d) : '');
 
   const title = document.createElement('div');
   title.className = 'ep-title';
@@ -557,9 +651,15 @@ function render() {
 
   $('empty').hidden = view.length > 0;
   if (!view.length) {
-    $('empty').textContent = feeds.length
-      ? (settings.hideFinished ? '没有未播放的单集了。关掉「隐藏已完播」可以看历史。' : '这里没有单集。')
-      : '正在加载订阅…';
+    if (!feeds.length) {
+      $('empty').textContent = '正在加载订阅…';
+    } else if (settings.doneView) {
+      $('empty').textContent = '还没有完播记录。';
+    } else {
+      $('empty').textContent = settings.hideFinished
+        ? '没有未播放的单集了。关掉「隐藏已完播」可以看历史。'
+        : '这里没有单集。';
+    }
   }
 }
 
@@ -583,16 +683,16 @@ function fill() {
 }
 
 function toggleDone(it) {
-  const now = Date.now();
-  const cur = progress[it.id] || {};
-  if (isFinished(cur)) {
-    // 取消完播：写成"墓碑"（f=0、位置归零、刷新时间戳）而不是删掉 ——
-    // 删掉的条目会被别的设备的旧记录同步回来，就取消不掉了
-    progress[it.id] = { p: 0, d: cur.d || it.e.d || 0, f: 0, u: now };
-  } else {
-    progress[it.id] = { p: cur.p || 0, d: cur.d || it.e.d || 0, f: 1, u: now };
-  }
+  const wasDone = isFinished(progress[it.id]);
+  const base = progress[it.id] || {};
+  // 取消完播写成"墓碑"（f=0、位置归零）而不是删掉 —— 删掉的条目会被别的设备的
+  // 旧记录同步回来，那就永远取消不掉了。
+  const pr = setFinished(it.id, !wasDone);
+  pr.d = base.d || it.e.d || 0;
+  pr.p = wasDone ? 0 : (base.p || 0);
+  touchProgress(it.id, null);        // 记一个新版本，撤回也会正确传播到其它设备
   saveProgress(true);
+  setStatus(wasDone ? '已撤回完播：' + it.e.t : '已标记完播：' + it.e.t);
   render();
 }
 
@@ -605,6 +705,65 @@ if ('webkitPreservesPitch' in audio) audio.webkitPreservesPitch = true;
 
 let pendingSeek = null;
 let seeking = false;
+let stallTimer = 0;
+let stallRetry = 0;
+let stallFrom = 0;
+
+const STALL_RETRY_MAX = 3;
+const STALL_WAIT_MS = 5000;          // 第 n 次重试等 n*5 秒
+
+// 网络断流时浏览器会把"已经缓冲到哪"当成整个音频资源的结尾：duration 会变成一个
+// 明显偏小的值（也可能直接是 NaN / Infinity），播到那儿就触发 ended。
+// 这和"真播完了"完全不是一回事，绝不能拿它当完播、更不能自动跳下一集。
+// 判据：媒体时长必须有限、大于 0，且不能明显短于 feed 里声明的时长。
+function mediaDurationOk() {
+  const dur = audio.duration;
+  if (!isFinite(dur) || dur <= 0) return false;
+  const declared = current && current.e.d ? current.e.d : 0;
+  return !(declared > 0 && dur < declared * 0.9);
+}
+// 显示/算百分比用的时长：媒体时长不可信就退回 feed 声明的，免得按错误总长算
+function displayDuration() {
+  if (mediaDurationOk()) return audio.duration;
+  return (current && current.e.d) || 0;
+}
+// 这次是不是真的播到结尾了
+function playbackCompleted() {
+  if (!current || audio.error || !mediaDurationOk()) return false;
+  return audio.currentTime >= audio.duration - 2;
+}
+
+function cancelResume() {
+  if (stallTimer) { clearTimeout(stallTimer); stallTimer = 0; }
+}
+
+// 断流不跳集，改成从断点重试拉流（退避重试，最多 3 次）
+function scheduleResume(reason) {
+  if (!current || stallTimer) return;
+  const id = current.id;
+  if (stallRetry >= STALL_RETRY_MAX) {
+    setStatus(reason + '，重试 ' + STALL_RETRY_MAX + ' 次仍未恢复，点播放可继续');
+    return;
+  }
+  stallRetry++;
+  const wait = STALL_WAIT_MS * stallRetry;
+  setStatus(reason + '，' + Math.round(wait / 1000) + ' 秒后从断点重试（'
+            + stallRetry + '/' + STALL_RETRY_MAX + '）');
+  stallTimer = setTimeout(() => {
+    stallTimer = 0;
+    if (!current || current.id !== id) return;   // 已经换集或关掉了
+    // 判断"是不是已经自己在放了"不能用 !audio.paused：加载失败的媒体元素会停在
+    // paused=false（play() 请求过、但资源选择就失败了），拿它当判据会把重试永远挡掉。
+    // 真正在放的特征是 readyState >= HAVE_CURRENT_DATA 且没有 error。
+    if (!audio.paused && !audio.error && audio.readyState >= 2) return;
+    stallFrom = (progress[id] && progress[id].p) || 0;
+    pendingSeek = stallFrom;
+    audio.src = toLocal(current.e.u);            // 重新走一遍资源选择，错误状态会被清掉
+    audio.load();
+    audio.playbackRate = settings.speed;
+    audio.play().catch(onPlayError);
+  }, wait);
+}
 
 audio.addEventListener('loadedmetadata', () => {
   audio.playbackRate = settings.speed;
@@ -612,35 +771,43 @@ audio.addEventListener('loadedmetadata', () => {
     try { audio.currentTime = pendingSeek; } catch (_) {}
     pendingSeek = null;
   }
-  if (current && audio.duration) {
-    const pr = progress[current.id] || (progress[current.id] = { p: 0, d: 0 });
-    pr.d = audio.duration;
-    pr.u = Date.now();
-    saveProgress(true);
+  if (current) {
+    const d = displayDuration();
+    if (d > 0) {
+      touchProgress(current.id, { d: d });
+      saveProgress(true);
+    }
   }
   updateTimes();
 });
 
 audio.addEventListener('timeupdate', () => {
   if (!current || !audio.duration) return;
-  if (!seeking) $('plSeek').value = String(Math.round((audio.currentTime / audio.duration) * 1000));
+  const d = displayDuration();
+  if (!d) return;
+  if (!seeking) $('plSeek').value = String(Math.round((audio.currentTime / d) * 1000));
   updateTimes();
 
-  const pr = progress[current.id] || (progress[current.id] = { p: 0, d: 0 });
-  pr.p = audio.currentTime;
-  pr.d = audio.duration;
-  pr.u = Date.now();               // 同步合并时按这个比新旧
-  if (audio.currentTime / audio.duration >= DONE_RATIO) pr.f = 1;
+  touchProgress(current.id, { p: audio.currentTime, d: d });
+  // 时长可信时才判断完播：断流造成的假 ended 不能落成完播记录。
+  // setFinished 只在 0->1 那一次记完播时间 c，所以重复调用不会把 c 冲成"最后一次写入时间"。
+  if (mediaDurationOk() && audio.currentTime / audio.duration >= DONE_RATIO) setFinished(current.id, true);
   saveProgress(false);
 
+  // 断流重试后又真播了一分钟才算恢复，把重试计数清零
+  if (stallRetry && stallFrom && audio.currentTime - stallFrom > 60) {
+    stallRetry = 0;
+    stallFrom = 0;
+  }
+
   const fillEl = bars.get(current.id);
-  if (fillEl) fillEl.style.width = ((audio.currentTime / audio.duration) * 100).toFixed(1) + '%';
+  if (fillEl) fillEl.style.width = ((audio.currentTime / d) * 100).toFixed(1) + '%';
 
   if ('mediaSession' in navigator && navigator.mediaSession.setPositionState) {
     try {
       navigator.mediaSession.setPositionState({
-        duration: audio.duration,
-        position: Math.min(audio.currentTime, audio.duration),
+        duration: d,
+        position: Math.min(audio.currentTime, d),
         playbackRate: audio.playbackRate,
       });
     } catch (_) {}
@@ -659,8 +826,9 @@ audio.addEventListener('play', () => {
   syncPlaybackState();
 });
 audio.addEventListener('playing', () => {
-  // 上一次的错误提示到这儿就算过去了
-  if ($('status').textContent.slice(0, 4) === '播放失败') setStatus('');
+  cancelResume();                  // 自己缓冲好了，不用再重试
+  const st = $('status').textContent;
+  if (st.slice(0, 4) === '播放失败' || st.indexOf('重试') >= 0) setStatus('');
 });
 audio.addEventListener('pause', () => {
   setPlayIcon(false);
@@ -668,11 +836,19 @@ audio.addEventListener('pause', () => {
   syncPlaybackState();
 });
 audio.addEventListener('ended', () => {
+  if (current && !playbackCompleted()) {
+    // 网络断流被当成"播完"了：记下位置，不标完播、不跳集，改成等网络恢复续播
+    touchProgress(current.id, {
+      p: Math.max((progress[current.id] && progress[current.id].p) || 0, audio.currentTime || 0),
+    });
+    saveProgress(true);
+    scheduleResume('音频被网络中断');
+    return;
+  }
   if (current) {
-    const pr = progress[current.id] || (progress[current.id] = { p: 0, d: 0 });
-    pr.f = 1;
+    const pr = setFinished(current.id, true);
     if (pr.d) pr.p = pr.d;
-    pr.u = Date.now();
+    touchProgress(current.id, {});
     saveProgress(true);
     render();
   }
@@ -681,20 +857,24 @@ audio.addEventListener('ended', () => {
   else setStatus('列表里没有可接着播的单集了');
 });
 audio.addEventListener('error', () => {
-  if (current && audio.getAttribute('src')) setStatus('音频加载失败（code ' + (audio.error ? audio.error.code : '?') + '）');
+  if (!current || !audio.getAttribute('src')) return;
+  // 加载失败同样不跳集，交给重试
+  scheduleResume('音频加载失败（code ' + (audio.error ? audio.error.code : '?') + '）');
 });
 
 function updateTimes() {
-  const d = audio.duration || (current && current.e.d) || 0;
-  $('plTime').textContent = fmtDur(audio.currentTime || 0) + ' / ' + fmtDur(d);
+  // 用 displayDuration()：媒体时长被截断/读不出来时退回 feed 声明的时长，
+  // 免得时间轴显示成 "0:12 / 0:12" 这种假的总长
+  $('plTime').textContent = fmtDur(audio.currentTime || 0) + ' / ' + fmtDur(displayDuration());
 }
 
 function updateMediaSession(it) {
   if (!('mediaSession' in navigator) || typeof MediaMetadata === 'undefined') return;
   const art = [];
-  const img = imgUrl(it.e.i);
-  // 锁屏封面走 CORS 拉图：bilibili 图床给了 ACAO:*，其它没给的会被忽略，不影响播放
-  if (img && img.slice(0, 6) === 'https:') art.push({ src: img, sizes: '512x512' });
+  // 用缩略图：MediaMetadata 的图走 CORS 拉取，同源的缩略图一定能过，
+  // 而且不用为了锁屏去拉一张上百 KB 的原图
+  const img = thumbUrl(it.e.i);
+  if (img) art.push({ src: img, sizes: '200x200' });
   navigator.mediaSession.metadata = new MediaMetadata({
     title: it.e.t, artist: it.f.title, album: '播客', artwork: art,
   });
@@ -711,9 +891,12 @@ function play(it) {
   const same = !!(current && current.id === it.id);
   if (same && !audio.paused) { audio.pause(); return; }
 
+  cancelResume();                          // 用户自己操作了，撤掉待执行的自动重试
   if (same) {
     pendingSeek = null;                    // 同一个单集，接着播，别跳
   } else {
+    stallRetry = 0;                        // 换集：重试计数从头算
+    stallFrom = 0;
     const pr = progress[it.id];
     pendingSeek = pr && !isFinished(pr) && pr.p > 5 ? pr.p : 0; // 断点续播
     audio.src = toLocal(it.e.u);
@@ -725,7 +908,7 @@ function play(it) {
   $('player').hidden = false;
   $('plTitle').textContent = it.e.t;
   $('plSub').textContent = it.f.title + ' · ' + fmtDate(it.e.p);
-  $('plImg').src = imgUrl(it.e.i);
+  $('plImg').src = thumbUrl(it.e.i);
   $('plSeek').value = '0';
   updateTimes();
   updateMediaSession(it);
@@ -738,6 +921,8 @@ function play(it) {
 // 报了反而像出错。真正的失败（格式不支持、源 404）才提示。
 function onPlayError(err) {
   if (err && err.name === 'AbortError') return;
+  // 已经排了重试就别覆盖 —— error 事件给出的提示（还能重试几次）比这句有用
+  if (stallTimer) return;
   setStatus('播放失败：' + ((err && err.message) || err));
 }
 
@@ -775,11 +960,19 @@ function applySpeed(v) {
   for (const b of $('speedRow').children) b.classList.toggle('on', Number(b.dataset.v) === v);
 }
 
+// 倍速属于同步设置：改一次就记一个逻辑版本，别的设备按"动作先后"跟进，
+// 不看墙上时钟（设备时钟差得多也不会误判谁更新）
+function bumpSettings() {
+  settingsAt = Date.now();
+  settingsV = nextVersion();
+  writeLS(LS_SETTINGS_AT, settingsAt);
+  writeLS(LS_SETTINGS_V, settingsV);
+}
+
 function setSpeed(v) {
   applySpeed(v);
   saveSettings();
-  settingsAt = Date.now();          // 倍速属于同步设置，改了要让别的设备跟上
-  writeLS(LS_SETTINGS_AT, settingsAt);
+  bumpSettings();
   schedulePush(1200);
 }
 
@@ -840,8 +1033,7 @@ function saveSpeedEdit() {
   settings.speeds = r.speeds;
   settings.speed = r.speeds.indexOf(settings.speed) >= 0 ? settings.speed : r.speeds[0];
   saveSettings();
-  settingsAt = Date.now();
-  writeLS(LS_SETTINGS_AT, settingsAt);
+  bumpSettings();
   applySpeed(settings.speed);
   renderSpeedRow();
   closeSpeedEdit();
@@ -868,6 +1060,7 @@ function applyTheme() {
 $('refresh').addEventListener('click', () => refresh(true));
 
 $('plPlay').addEventListener('click', () => {
+  cancelResume();
   if (audio.paused) audio.play().catch(onPlayError);
   else audio.pause();
 });
@@ -889,10 +1082,12 @@ $('plClose').addEventListener('click', () => {
 const seek = $('plSeek');
 seek.addEventListener('input', () => { seeking = true; });
 seek.addEventListener('change', () => {
-  if (audio.duration) {
-    try { audio.currentTime = (Number(seek.value) / 1000) * audio.duration; } catch (_) {}
+  const d = displayDuration();
+  if (d > 0) {
+    try { audio.currentTime = (Number(seek.value) / 1000) * d; } catch (_) {}
   }
   seeking = false;
+  cancelResume();                  // 用户自己定位了，撤掉待执行的自动重试
   saveProgress(true);
 });
 
@@ -935,6 +1130,13 @@ $('hideBtn').addEventListener('click', () => {
   render();
 });
 
+$('doneBtn').addEventListener('click', () => {
+  settings.doneView = !settings.doneView;
+  saveSettings();
+  syncToolbar();
+  render();
+});
+
 // 切后台/关页面：落盘 + 推一次云端；回到前台顺手拉一次别的设备的新数据
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
@@ -949,6 +1151,11 @@ function syncToolbar() {
   $('sortBtn').textContent = settings.sortDesc ? '↓ 最新在前' : '↑ 最早在前';
   $('hideBtn').classList.toggle('on', settings.hideFinished);
   $('hideBtn').setAttribute('aria-checked', String(settings.hideFinished));
+  $('doneBtn').classList.toggle('on', !!settings.doneView);
+  $('doneBtn').setAttribute('aria-checked', String(!!settings.doneView));
+  // 完播视图自带固定排序、且本来就只看已完播的那两个开关在这个视图里没意义，先收起来
+  $('sortBtn').hidden = !!settings.doneView;
+  $('hideBtn').hidden = !!settings.doneView;
 }
 
 function syncFeedSelect() {

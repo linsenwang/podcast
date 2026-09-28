@@ -1,12 +1,12 @@
 /* 极简播客客户端 service worker：网络优先 + 离线回退缓存 */
 'use strict';
 
-// 换版本号会让 SW 重新 install（重新预缓存外壳）并让 activate 清掉旧缓存。
-// 现在静态资源都带 no-cache 会自己回源确认，正常不用手动提，
-// 但客户端已经装成 PWA、卡在旧代码上时，提一次版本号是最直接的踢醒手段。
-const VERSION = 'podcast-v2';
+// 图标被 SW 缓存优先接管了（见下面 cacheFirst），所以换图标必须提版本号，
+// 否则已经装过 PWA 的客户端会一直用缓存里那套旧图。
+const VERSION = 'podcast-v3';
 const SYNC_PATH = new URL('sync/', self.registration.scope).pathname;
 const ICONS_PATH = new URL('icons/', self.registration.scope).pathname;
+const THUMB_PATH = new URL('thumb', self.registration.scope).pathname;
 
 const SHELL = [
   './',
@@ -85,6 +85,10 @@ self.addEventListener('fetch', (e) => {
   // 同步接口完全不碰：一是不能进缓存（否则可能拿到旧进度），
   // 二是不必让 SW 挡在中间转一手 —— 它只是即时的一来一回读写。
   if (url.pathname.startsWith(SYNC_PATH)) return;
+
+  // 封面缩略图也不拦：服务端已经给了 immutable 的长缓存，交给浏览器 HTTP 缓存
+  // 就行，不必再往 SW 缓存里塞几百张小图
+  if (url.pathname.startsWith(THUMB_PATH)) return;
 
   if (url.pathname.startsWith(ICONS_PATH)) {
     e.respondWith(cacheFirst(req));

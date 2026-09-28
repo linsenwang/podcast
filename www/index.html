@@ -12,7 +12,11 @@
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<!-- 用 default 不用 black-translucent：后者让 WKWebView 铺满整屏（内容钻到状态栏
+     底下），在没有刘海的机型（如 iPhone SE）上 safe-area-inset-top 拿不到状态栏
+     高度 → 标题会被状态栏压住，而且文档高度和真实可用高度对不上时，最底下会露出
+     WebView 自己的白底，就是那条莫名的全宽白条。 -->
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="播客">
 <script>
 // 先定主题再加载样式表，避免浅色模式下先闪一下深色。
@@ -43,6 +47,8 @@
   <select id="feedSel" aria-label="选择订阅源"></select>
   <button id="sortBtn" class="chip" aria-label="排序方式"></button>
   <button id="hideBtn" class="chip" role="switch" aria-checked="true">隐藏已完播</button>
+  <!-- 完播是容易点错的，单开一个按"完播时间"排的视图，进去直接撤回 -->
+  <button id="doneBtn" class="chip" role="switch" aria-checked="false">最近完播</button>
 </div>
 
 <main id="list" class="list" aria-live="polite">

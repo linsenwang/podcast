@@ -46,6 +46,25 @@ html, body {
   height: 100%;
 }
 
+/* html 也要自己带底色。iOS 独立模式（PWA）下 100vh/100dvh 不一定等于真实可用
+   高度，文档盖不到的那截会由 WKWebView 用它自己的白底补上 —— 视觉上就是屏幕最
+   底下一条全宽白条。底色写到 html 上是这类问题最省事的兜底。 */
+html {
+  background-color: var(--bg);
+}
+
+/* 上面那个高度差的正主：-webkit-fill-available 拿到的是 WebView 真实可用高度。
+   这个特性查询只在 iOS(iOS Safari / WKWebView) 成立，桌面和安卓不受影响。 */
+@supports (-webkit-touch-callout: none) {
+  html {
+    height: -webkit-fill-available;
+  }
+  body {
+    height: 100%;
+    min-height: -webkit-fill-available;
+  }
+}
+
 body {
   height: 100vh;
   height: 100dvh;

@@ -1,2 +1,7 @@
 # 跨设备同步的落盘数据：每台设备一个 json，属于运行时状态，不进仓库
 sync/*.json
+
+# 封面缩略图的磁盘缓存：全是能从上游重新抓出来的派生数据，删了整个目录也会自愈，
+# 只是把 .gitkeep 留下，免得目录不存在时 bind mount 被 docker 建成 root 属主。
+thumbs/cache/*
+!thumbs/cache/.gitkeep
