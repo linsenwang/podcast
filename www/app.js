@@ -11,6 +11,7 @@ const FEED_BASE = new URL('feeds/', document.baseURI).href; // 同源反代前�
 const INDEX_URL = FEED_BASE + 'podsync.opml';
 const SYNC_BASE = new URL('sync/', document.baseURI).href;  // nginx WebDAV 目录
 const THUMB_BASE = new URL('thumb', document.baseURI).href;  // 服务端缩略图接口
+const COVER_FALLBACK = new URL('icons/icon-192.png', document.baseURI).href; // 没封面时的占位图（PWA 图标）
 const STALE_MS = 15 * 60 * 1000;   // 超过这个时间就重取单个 feed
 const PAGE_SIZE = 60;              // 列表分批渲染，避免一次塞几千个节点
 const DONE_RATIO = 0.98;           // 播到这里就算完播
@@ -447,6 +448,11 @@ async function loadIndex() {
       url: toLocal(xmlUrl),
     });
   }
+  // 本地 TTS 音频（index-tts 生成）：不在 podsync 的 opml 里，这里补一条。
+  // feed 和音频都由 podcast 的 nginx 同源提供（见 nginx.conf 的 /tts/），
+  // 服务没起来时只是这一项刷新失败，不影响其他订阅。
+  const ttsFeed = new URL('tts/feed.xml', document.baseURI).href;
+  list.push({ id: 'tts', title: '本地 TTS', xmlUrl: ttsFeed, url: ttsFeed });
   return list;
 }
 
@@ -590,8 +596,10 @@ function rowEl(it) {
   cover.referrerPolicy = 'no-referrer';
   cover.fetchPriority = 'low';        // 永远别跟音频抢带宽
   const coverSrc = thumbUrl(it.e.i);
-  if (coverSrc) cover.src = coverSrc;
-  cover.addEventListener('error', () => cover.removeAttribute('src'));
+  // 没封面（feed 里没有 image，或缩略图抓取失败）就用 PWA 图标占位，
+  // 比留个空白格好认；once 是防止占位图自己也失败时反复触发。
+  cover.src = coverSrc || COVER_FALLBACK;
+  cover.addEventListener('error', () => { cover.src = COVER_FALLBACK; }, { once: true });
 
   const main = document.createElement('div');
   main.className = 'ep-main';
