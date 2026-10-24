@@ -2,20 +2,20 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
 <!-- bilibili 图床对"非 bilibili 的 Referer"直接 403，不发 Referer 才给图 -->
 <meta name="referrer" content="no-referrer">
 <title>播客</title>
-<meta name="theme-color" content="#0f1115">
+<meta name="theme-color" content="#171a21">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<!-- 用 default 不用 black-translucent：后者让 WKWebView 铺满整屏（内容钻到状态栏
-     底下），在没有刘海的机型（如 iPhone SE）上 safe-area-inset-top 拿不到状态栏
-     高度 → 标题会被状态栏压住，而且文档高度和真实可用高度对不上时，最底下会露出
-     WebView 自己的白底，就是那条莫名的全宽白条。 -->
+<!-- 状态栏颜色用 iOS 15+ 支持的 theme-color 控制（见下面那几个 meta），
+     不要用 black-translucent：那会让 WebView 铺到状态栏底下，顶栏还要再加
+     env(safe-area-inset-top) 的 padding，实际机型上会出现状态栏和按钮之间
+     空出一大截的问题。default 让系统把页面排在状态栏下面，布局最稳。 -->
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="播客">
 <script>
@@ -35,7 +35,6 @@
 <body>
 
 <header class="top">
-  <h1>播客</h1>
   <div class="top-right">
     <span id="status" class="status"></span>
     <button id="theme" class="icon-btn" title="主题"><span id="themeIco" class="ico ico-auto"></span></button>
@@ -45,10 +44,15 @@
 
 <div class="toolbar">
   <select id="feedSel" aria-label="选择订阅源"></select>
-  <button id="sortBtn" class="chip" aria-label="排序方式"></button>
-  <button id="hideBtn" class="chip" role="switch" aria-checked="true">隐藏已完播</button>
-  <!-- 完播是容易点错的，单开一个按"完播时间"排的视图，进去直接撤回 -->
-  <button id="doneBtn" class="chip" role="switch" aria-checked="false">最近完播</button>
+  <!-- 排序 / 隐藏已完播 / 最近完播收进一个下拉，点「筛选」才展开 -->
+  <div class="filter-wrap">
+    <button id="filterBtn" class="chip filter-btn" type="button" aria-haspopup="true" aria-expanded="false">筛选</button>
+    <div id="filterMenu" class="filter-menu" hidden>
+      <button id="sortBtn" class="chip" type="button" aria-label="排序方式"></button>
+      <button id="hideBtn" class="chip" type="button" role="switch" aria-checked="true">隐藏已完播</button>
+      <button id="doneBtn" class="chip" type="button" role="switch" aria-checked="false">最近完播</button>
+    </div>
+  </div>
 </div>
 
 <main id="list" class="list" aria-live="polite">
@@ -80,11 +84,13 @@
       <button id="plBack" class="icon-btn" title="后退 10 秒" aria-label="后退 10 秒"><span class="ico ico-replay"></span></button>
       <button id="plPlay" class="play-btn" title="播放/暂停" aria-label="播放"><span id="plIcon" class="ico ico-play"></span></button>
       <button id="plFwd" class="icon-btn" title="前进 30 秒" aria-label="前进 30 秒"><span class="ico ico-forward"></span></button>
-      <button id="plSpeed" class="speed-btn" title="倍速" aria-label="播放倍速">1×</button>
+      <!-- 倍速：点这个数字，在上方弹出预设列表 -->
+      <div class="speed-wrap">
+        <button id="plSpeed" class="speed-btn" title="倍速" aria-label="播放倍速" aria-haspopup="menu" aria-expanded="false">2×</button>
+        <div id="speedMenu" class="speed-menu" role="menu" aria-label="播放倍速" hidden></div>
+      </div>
     </div>
   </div>
-
-  <div id="speedRow" class="speed-row" hidden></div>
 
   <div id="speedEdit" class="speed-edit" hidden>
     <div class="speed-edit-hint">倍速预设（逗号分隔，0.5–4，最多 12 个）</div>

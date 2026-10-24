@@ -44,6 +44,9 @@
 html, body {
   margin: 0;
   height: 100%;
+  /* 禁掉双击缩放；双指缩放由 index.html 的 viewport 和 app.js 里的
+     gesturestart 拦截一起兜住（iOS 不认 user-scalable=no） */
+  touch-action: manipulation;
 }
 
 /* html 也要自己带底色。iOS 独立模式（PWA）下 100vh/100dvh 不一定等于真实可用
@@ -84,13 +87,12 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .top {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;   /* 左上角不再放标题，状态和按钮都靠右 */
   gap: 8px;
   padding: calc(10px + env(safe-area-inset-top)) 14px 10px;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
 }
-.top h1 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: .5px; }
 .top-right { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .status { font-size: 12px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
@@ -149,6 +151,38 @@ button { font: inherit; color: inherit; cursor: pointer; }
   font: inherit;
   font-size: 13px;
 }
+/* 视图筛选下拉：和原来一样三个按钮，只是收起来，点「筛选」才展开。
+   外观照倍速菜单来：外层小圆角 + 内部条目方一点，别再是胶囊套圆角盒子。 */
+.filter-wrap { position: relative; flex: 0 0 auto; }
+.filter-btn { flex: 0 0 auto; }
+.filter-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 132px;
+  padding: 5px;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, .35);
+}
+:root[data-theme="light"] .filter-menu { box-shadow: 0 8px 26px rgba(20, 30, 60, .18); }
+.filter-menu[hidden] { display: none; }
+.filter-menu .chip {
+  border: 0;
+  background: transparent;
+  border-radius: 7px;
+  padding: 8px 12px;
+  font-size: 13px;
+  text-align: left;
+  color: var(--dim);
+}
+.filter-menu .chip:active { background: var(--pressed); }
+.filter-menu .chip.on { color: var(--fg); background: var(--sel); }
 .chip {
   flex: 0 0 auto;
   white-space: nowrap;
@@ -260,25 +294,42 @@ button { font: inherit; color: inherit; cursor: pointer; }
   font-variant-numeric: tabular-nums;
 }
 
-.speed-row { display: flex; gap: 6px; margin-top: 9px; overflow-x: auto; }
-.speed-row button {
-  flex: 0 0 auto;
-  border: 1px solid var(--line);
+/* 倍速选择：点速度数字，在按钮上方弹出预设列表 */
+.speed-wrap { position: relative; }
+.speed-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 88px;
+  padding: 5px;
   background: var(--panel2);
-  border-radius: 999px;
-  padding: 5px 12px;
-  font-size: 12.5px;
-  color: var(--dim);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, .35);
+}
+:root[data-theme="light"] .speed-menu { box-shadow: 0 8px 26px rgba(20, 30, 60, .18); }
+/* 有 display:flex 的浮层必须显式处理 hidden，否则 [hidden] 会被作者样式盖掉，
+   一进页面就摊开着 */
+.speed-menu[hidden] { display: none; }
+.speed-menu button {
+  border: 0;
+  background: transparent;
+  border-radius: 7px;
+  padding: 8px 12px;
+  font-size: 13px;
+  text-align: left;
+  color: var(--fg);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
-.speed-row button.on { border-color: var(--accent); color: var(--fg); background: var(--sel); }
-/* 行尾的 + ：进入倍速预设编辑 */
-.speed-row .speed-add {
-  padding: 5px 9px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
+.speed-menu button.on { background: var(--sel); }
+.speed-menu button:active { background: var(--pressed); }
+/* 列表末尾的「编辑…」 */
+.speed-menu .speed-add { color: var(--dim); }
 
 /* ---------- 倍速预设编辑 ---------- */
 .speed-edit { margin-top: 9px; border-top: 1px dashed var(--line); padding-top: 9px; }

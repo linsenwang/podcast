@@ -15,7 +15,9 @@ const COVER_FALLBACK = new URL('icons/icon-192.png', document.baseURI).href; // 
 const STALE_MS = 15 * 60 * 1000;   // 超过这个时间就重取单个 feed
 const PAGE_SIZE = 60;              // 列表分批渲染，避免一次塞几千个节点
 const DONE_RATIO = 0.98;           // 播到这里就算完播
-const DEFAULT_SPEEDS = [1, 1.25, 1.5, 1.75, 2, 2.5, 3];
+const SPEEDS_REV = 2;               // 倍速预设表改版号：rev 2 起固定为 1.25/1.5/2/3
+const DEFAULT_SPEEDS = [1.25, 1.5, 2, 3];
+const DEFAULT_SPEED = 2;            // 默认播放倍速
 const THEMES = ['auto', 'light', 'dark'];
 const BACK_SEC = 10;                // 后退秒数，与 icons/replay_10.svg 上的数字一致
 const FWD_SEC = 30;                 // 前进秒数，与 icons/forward_30.svg 上的数字一致
@@ -45,13 +47,14 @@ function writeLS(key, val) {
 }
 
 let settings = Object.assign(
-  { hideFinished: true, sortDesc: true, feed: '', speed: 1, speeds: null, theme: 'auto', doneView: false },
+  { hideFinished: true, sortDesc: true, feed: '', speed: DEFAULT_SPEED, speeds: null, speedsRev: 1, theme: 'auto', doneView: false },
   readLS(LS_SETTINGS, {})
 );
 // 兜住历史数据 / 手改坏的值
 if (!Array.isArray(settings.speeds) || !settings.speeds.length) settings.speeds = DEFAULT_SPEEDS.slice();
+settings.speedsRev = Number(settings.speedsRev) || 1;
 if (THEMES.indexOf(settings.theme) < 0) settings.theme = 'auto';
-if (!(settings.speed > 0)) settings.speed = 1;
+if (!(settings.speed > 0)) settings.speed = DEFAULT_SPEED;
 
 let progress = readLS(LS_PROGRESS, {}) || {};
 // 倍速预设的版本/时间：优先用逻辑版本（和进度用同一个时钟），时间只作老数据的兜底
@@ -151,7 +154,7 @@ function syncPayload() {
     at: Date.now(),
     settingsAt: settingsAt,
     settingsV: settingsV,
-    settings: { speed: settings.speed, speeds: settings.speeds },
+    settings: { speed: settings.speed, speeds: settings.speeds, speedsRev: settings.speedsRev },
     progress: progress,
   };
 }
@@ -262,12 +265,16 @@ function mergeDocs(docs) {
     writeLS(LS_SETTINGS_AT, settingsAt);
     writeLS(LS_SETTINGS_V, settingsV);
     if (best.settings.speed > 0) settings.speed = best.settings.speed;
-    if (Array.isArray(best.settings.speeds) && best.settings.speeds.length) {
+    // 预设表只接受不比本地旧的版本（rev 2 起不能被老客户端推回来的表覆盖）
+    const remoteRev = Number(best.settings.speedsRev) || 1;
+    if (Array.isArray(best.settings.speeds) && best.settings.speeds.length
+        && remoteRev >= (Number(settings.speedsRev) || 1)) {
       settings.speeds = best.settings.speeds;
+      settings.speedsRev = remoteRev;
     }
     saveSettings();
     applySpeed(settings.speed);
-    renderSpeedRow();
+    renderSpeedMenu();
     merged++;
   }
 
@@ -1099,7 +1106,12 @@ function applySpeed(v) {
   settings.speed = v;
   audio.playbackRate = v;
   $('plSpeed').textContent = v + '×';
-  for (const b of $('speedRow').children) b.classList.toggle('on', Number(b.dataset.v) === v);
+  for (const b of $('speedMenu').children) {
+    if (b.dataset.v == null) continue;       // 「编辑…」没有倍速值
+    const on = Number(b.dataset.v) === v;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-checked', String(on));
+  }
 }
 
 // 倍速属于同步设置：改一次就记一个逻辑版本，别的设备按"动作先后"跟进，
@@ -1118,31 +1130,79 @@ function setSpeed(v) {
   schedulePush(1200);
 }
 
-function renderSpeedRow() {
-  const row = $('speedRow');
-  row.innerHTML = '';
+// 预设表改版：老数据（包括历史上手改过的列表）一次性换成新默认表，
+// 并记一次设置变更让别的设备也跟随；之后再编辑就尊重用户自己的列表。
+function applySpeedPresetRev() {
+  if ((Number(settings.speedsRev) || 1) >= SPEEDS_REV) return;
+  settings.speedsRev = SPEEDS_REV;
+  settings.speeds = DEFAULT_SPEEDS.slice();
+  if (settings.speeds.indexOf(settings.speed) < 0) settings.speed = DEFAULT_SPEED;
+  saveSettings();
+  bumpSettings();
+  applySpeed(settings.speed);
+  renderSpeedMenu();
+  schedulePush(1500);
+}
+
+// 点倍速数字弹出的预设菜单（在按钮上方），末尾一项进入预设编辑
+function renderSpeedMenu() {
+  const menu = $('speedMenu');
+  menu.innerHTML = '';
   for (const v of settings.speeds) {
     const b = document.createElement('button');
     b.type = 'button';
     b.dataset.v = String(v);
+    b.setAttribute('role', 'menuitemradio');
     b.textContent = v + '×';
-    b.classList.toggle('on', v === settings.speed);
-    b.addEventListener('click', () => setSpeed(v));
-    row.appendChild(b);
+    const on = v === settings.speed;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-checked', String(on));
+    b.addEventListener('click', () => {
+      setSpeed(v);
+      closeSpeedMenu();
+    });
+    menu.appendChild(b);
   }
   const add = document.createElement('button');
   add.type = 'button';
   add.className = 'speed-add';
-  add.title = '编辑倍速预设';
-  add.setAttribute('aria-label', '编辑倍速预设');
-  const ico = document.createElement('span');
-  ico.className = 'ico ico-add';
-  add.appendChild(ico);
+  add.setAttribute('role', 'menuitem');
+  add.textContent = '编辑…';
   add.addEventListener('click', () => {
-    if ($('speedEdit').hidden) openSpeedEdit();
-    else closeSpeedEdit();
+    closeSpeedMenu();
+    openSpeedEdit();
   });
-  row.appendChild(add);
+  menu.appendChild(add);
+}
+
+function closeSpeedMenu() {
+  const menu = $('speedMenu');
+  if (menu.hidden) return;
+  menu.hidden = true;
+  $('plSpeed').setAttribute('aria-expanded', 'false');
+}
+
+function toggleSpeedMenu() {
+  const menu = $('speedMenu');
+  if (!menu.hidden) { closeSpeedMenu(); return; }
+  closeFilterMenu();               // 两个浮层别同时开着
+  menu.hidden = false;
+  $('plSpeed').setAttribute('aria-expanded', 'true');
+}
+
+function closeFilterMenu() {
+  const menu = $('filterMenu');
+  if (menu.hidden) return;
+  menu.hidden = true;
+  $('filterBtn').setAttribute('aria-expanded', 'false');
+}
+
+function toggleFilterMenu() {
+  const menu = $('filterMenu');
+  if (!menu.hidden) { closeFilterMenu(); return; }
+  closeSpeedMenu();
+  menu.hidden = false;
+  $('filterBtn').setAttribute('aria-expanded', 'true');
 }
 
 function openSpeedEdit() {
@@ -1177,7 +1237,7 @@ function saveSpeedEdit() {
   saveSettings();
   bumpSettings();
   applySpeed(settings.speed);
-  renderSpeedRow();
+  renderSpeedMenu();
   closeSpeedEdit();
   schedulePush(1200);
 }
@@ -1193,9 +1253,10 @@ function applyTheme() {
   const btn = $('theme');
   btn.title = '主题：' + THEME_LABEL[settings.theme] + '（点击切换）';
   btn.setAttribute('aria-label', btn.title);
-  // 浏览器/系统状态栏颜色跟着走
+  // 浏览器/系统状态栏颜色跟着走：用顶栏的 --panel 色（不是页面底色），
+  // iOS 15+ / 安卓都靠 theme-color 给状态栏上色
   const meta = document.querySelector('meta[name=theme-color]');
-  if (meta) meta.setAttribute('content', t === 'light' ? '#ffffff' : '#0f1115');
+  if (meta) meta.setAttribute('content', t === 'light' ? '#ffffff' : '#171a21');
 }
 
 /* ================= 交互绑定 ================= */
@@ -1210,6 +1271,8 @@ $('plFwd').addEventListener('click', () => seekBy(FWD_SEC));
 $('plClose').addEventListener('click', () => {
   wantPlay = false;
   cancelResume();
+  closeSpeedMenu();
+  closeSpeedEdit();
   saveProgress(true);
   audio.pause();
   try { audio.removeAttribute('src'); audio.load(); } catch (_) {}
@@ -1227,9 +1290,11 @@ seek.addEventListener('change', () => {
   seeking = false;
 });
 
-$('plSpeed').addEventListener('click', () => {
-  const row = $('speedRow');
-  row.hidden = !row.hidden;
+// 点速度数字弹出预设菜单；点页面别处收起
+$('plSpeed').addEventListener('click', toggleSpeedMenu);
+document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('.speed-wrap')) closeSpeedMenu();
+  if (!ev.target.closest('.filter-wrap')) closeFilterMenu();
 });
 
 $('theme').addEventListener('click', () => {
@@ -1251,6 +1316,9 @@ $('feedSel').addEventListener('change', (e) => {
   saveSettings();
   render();
 });
+
+// 筛选下拉：里面还是原来那三个按钮，点「筛选」才展开
+$('filterBtn').addEventListener('click', toggleFilterMenu);
 
 $('sortBtn').addEventListener('click', () => {
   settings.sortDesc = !settings.sortDesc;
@@ -1292,15 +1360,23 @@ window.addEventListener('pagehide', () => saveProgress(true));
 
 setupMediaSession();
 
+// iOS 不认 viewport 里的 user-scalable=no / maximum-scale=1，双指缩放只能自己拦。
+// 本页面没有需要缩放的内容，直接掐掉 WebKit 的 gesture 事件。
+document.addEventListener('gesturestart', (e) => e.preventDefault());
+document.addEventListener('gesturechange', (e) => e.preventDefault());
+
 function syncToolbar() {
   $('sortBtn').textContent = settings.sortDesc ? '↓ 最新在前' : '↑ 最早在前';
   $('hideBtn').classList.toggle('on', settings.hideFinished);
   $('hideBtn').setAttribute('aria-checked', String(settings.hideFinished));
   $('doneBtn').classList.toggle('on', !!settings.doneView);
   $('doneBtn').setAttribute('aria-checked', String(!!settings.doneView));
-  // 完播视图自带固定排序、且本来就只看已完播的那两个开关在这个视图里没意义，先收起来
+  // 完播视图自带固定排序、也只看完播过的，那两个开关在这个视图里没意义，先收起来
   $('sortBtn').hidden = !!settings.doneView;
   $('hideBtn').hidden = !!settings.doneView;
+  // 有非默认状态时给「筛选」加个高亮，收起后也能看出列表被筛过
+  const custom = !!settings.doneView || !settings.sortDesc || !settings.hideFinished;
+  $('filterBtn').classList.toggle('on', custom);
 }
 
 function syncFeedSelect() {
@@ -1346,8 +1422,9 @@ function restorePlayer() {
 
 /* ================= 启动 ================= */
 async function boot() {
+  applySpeedPresetRev();   // 预设表改版要赶在第一次渲染/同步之前
   applyTheme();
-  renderSpeedRow();
+  renderSpeedMenu();
   applySpeed(settings.speed);
   syncToolbar();
 
