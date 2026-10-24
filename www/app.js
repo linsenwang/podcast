@@ -24,6 +24,7 @@ const PULL_EVERY = 60 * 1000;       // 回到前台时，距上次拉取超过�
 const LS_INDEX = 'podcast.index';
 const LS_SETTINGS = 'podcast.settings';
 const LS_PROGRESS = 'podcast.progress';
+const LS_CURRENT = 'podcast.current'; // 上次播放的单集（iOS 后台被回收后用来把播放器摆回来）
 const LS_DEVICE = 'podcast.device';
 const LS_SETTINGS_AT = 'podcast.settingsAt';
 const LS_SETTINGS_V = 'podcast.settingsV';
@@ -705,7 +706,15 @@ function toggleDone(it) {
 }
 
 /* ================= 播放器 ================= */
-const audio = new Audio();
+// 用文档里的 <audio>（见 index.html），不要 new Audio()：iOS 装到桌面的 PWA
+// 切后台时会把脱离文档的媒体元素挂起，后台播放/锁屏控制/暂停后恢复全都失效。
+// 兜底兼容旧缓存里的 index.html（没有这个节点时自己建一个并挂到 body）。
+const audio = $('player-audio') || (() => {
+  const el = document.createElement('audio');
+  el.id = 'player-audio';
+  document.body.appendChild(el);
+  return el;
+})();
 audio.preload = 'metadata';
 audio.preservesPitch = true;
 if ('mozPreservesPitch' in audio) audio.mozPreservesPitch = true;
@@ -716,6 +725,10 @@ let seeking = false;
 let stallTimer = 0;
 let stallRetry = 0;
 let stallFrom = 0;
+// 用户的播放意图。不能拿 audio.paused 当"是不是该在播"：
+// 切后台/来电/加载失败都可能让元素停在 paused=false 却没声音的状态，
+// 之后点播放反而执行 pause，于是"暂停了再也回不来"。
+let wantPlay = false;
 
 const STALL_RETRY_MAX = 3;
 const STALL_WAIT_MS = 5000;          // 第 n 次重试等 n*5 秒
@@ -745,12 +758,65 @@ function cancelResume() {
   if (stallTimer) { clearTimeout(stallTimer); stallTimer = 0; }
 }
 
+// 元素现在是不是真的能出声：paused 不可信（见前面 wantPlay 的注释），
+// 有数据、没错误才算数。
+function isMediaAlive() {
+  return !audio.error && audio.readyState >= 2;
+}
+
+// 重新走一遍资源选择，再定位回断点播放。
+// 后台被系统挂起/中断之后，元素可能停在"请求过播放但没有任何数据"甚至 error 的状态，
+// 这时光调 play() 不会重新拉流，必须 load()。
+function reloadAt(pos) {
+  if (!current) return;
+  pendingSeek = pos > 0 ? pos : null;
+  audio.src = toLocal(current.e.u);
+  audio.load();
+  audio.playbackRate = settings.speed;
+  wantPlay = true;
+  audio.play().catch(onPlayError);
+}
+
+// 想继续播（锁屏播放键、回来点播放、从后台恢复）都走这里
+function requestPlay() {
+  if (!current) return;
+  cancelResume();                      // 用户/系统主动操作了，撤掉待执行的自动重试
+  wantPlay = true;
+  audio.playbackRate = settings.speed;
+  if (audio.error) {                   // 上次加载失败过：直接 play() 救不回来
+    reloadAt(audio.currentTime || (progress[current.id] && progress[current.id].p) || 0);
+    return;
+  }
+  audio.play().catch(onPlayError);
+}
+
+// 用户主动暂停：清掉播放意图，回到前台时不会被自动恢复
+function userPause() {
+  wantPlay = false;
+  cancelResume();
+  audio.pause();
+  saveProgress(true);
+}
+
+// 从后台回到前台 / bfcache 恢复：意图是播放、元素却没了声音，就重新拉流续播。
+// 系统在后台把 WebContent 挂起时，定时器也会一起冻住，自动重试用不上，
+// 只能等回到前台补这一下。
+function resumeIfNeeded() {
+  if (!current || !wantPlay || stallTimer) return;
+  if (!audio.paused && isMediaAlive()) return;   // 正在正常播放，别打扰
+  const at = audio.currentTime > 0
+    ? audio.currentTime
+    : ((progress[current.id] && progress[current.id].p) || 0);
+  reloadAt(at);
+}
+
 // 断流不跳集，改成从断点重试拉流（退避重试，最多 3 次）
 function scheduleResume(reason) {
   if (!current || stallTimer) return;
   const id = current.id;
   if (stallRetry >= STALL_RETRY_MAX) {
     setStatus(reason + '，重试 ' + STALL_RETRY_MAX + ' 次仍未恢复，点播放可继续');
+    wantPlay = false;                // 别让按钮卡在"播放中"，等用户明确点一次
     return;
   }
   stallRetry++;
@@ -760,16 +826,9 @@ function scheduleResume(reason) {
   stallTimer = setTimeout(() => {
     stallTimer = 0;
     if (!current || current.id !== id) return;   // 已经换集或关掉了
-    // 判断"是不是已经自己在放了"不能用 !audio.paused：加载失败的媒体元素会停在
-    // paused=false（play() 请求过、但资源选择就失败了），拿它当判据会把重试永远挡掉。
-    // 真正在放的特征是 readyState >= HAVE_CURRENT_DATA 且没有 error。
-    if (!audio.paused && !audio.error && audio.readyState >= 2) return;
+    if (!audio.paused && isMediaAlive()) return; // 已经自己在放了
     stallFrom = (progress[id] && progress[id].p) || 0;
-    pendingSeek = stallFrom;
-    audio.src = toLocal(current.e.u);            // 重新走一遍资源选择，错误状态会被清掉
-    audio.load();
-    audio.playbackRate = settings.speed;
-    audio.play().catch(onPlayError);
+    reloadAt(stallFrom);
   }, wait);
 }
 
@@ -787,13 +846,15 @@ audio.addEventListener('loadedmetadata', () => {
     }
   }
   updateTimes();
+  updateSeekBar();
+  updatePositionState();
 });
 
 audio.addEventListener('timeupdate', () => {
   if (!current || !audio.duration) return;
   const d = displayDuration();
   if (!d) return;
-  if (!seeking) $('plSeek').value = String(Math.round((audio.currentTime / d) * 1000));
+  if (!seeking) updateSeekBar();
   updateTimes();
 
   touchProgress(current.id, { p: audio.currentTime, d: d });
@@ -811,16 +872,50 @@ audio.addEventListener('timeupdate', () => {
   const fillEl = bars.get(current.id);
   if (fillEl) fillEl.style.width = ((audio.currentTime / d) * 100).toFixed(1) + '%';
 
-  if ('mediaSession' in navigator && navigator.mediaSession.setPositionState) {
-    try {
-      navigator.mediaSession.setPositionState({
-        duration: d,
-        position: Math.min(audio.currentTime, d),
-        playbackRate: audio.playbackRate,
-      });
-    } catch (_) {}
-  }
+  updatePositionState();
 });
+
+function updatePositionState() {
+  if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState) return;
+  if (!current) return;
+  const d = displayDuration();
+  if (!(d > 0)) return;
+  try {
+    navigator.mediaSession.setPositionState({
+      duration: d,
+      position: Math.min(Math.max(audio.currentTime || 0, 0), d),
+      playbackRate: audio.playbackRate,
+    });
+  } catch (_) {}
+}
+
+// 定位的唯一入口：锁屏拖动、±10/30 秒、页内进度条都走它。
+// 元数据还没到时先记进 pendingSeek（loadedmetadata 会应用），
+// 否则 currentTime 赋值会被元素直接丢掉。
+function seekTo(t) {
+  if (!current || !isFinite(t)) return;
+  t = Math.max(0, t);
+  const d = displayDuration();
+  if (d > 0) t = Math.min(t, d);
+  if (audio.readyState >= 1) {
+    try { audio.currentTime = t; } catch (_) {}
+  } else {
+    pendingSeek = t;
+  }
+  cancelResume();                 // 用户自己定位了，撤掉待执行的自动重试
+  touchProgress(current.id, { p: t });
+  saveProgress(true);
+  updateTimes();
+  updatePositionState();
+}
+
+function seekBy(delta) {
+  if (!current) return;
+  const base = audio.readyState >= 1 && isFinite(audio.currentTime) && audio.currentTime > 0
+    ? audio.currentTime
+    : (pendingSeek != null ? pendingSeek : ((progress[current.id] && progress[current.id].p) || 0));
+  seekTo(base + delta);
+}
 
 function syncPlaybackState() {
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = audio.paused ? 'paused' : 'playing';
@@ -842,6 +937,7 @@ audio.addEventListener('pause', () => {
   setPlayIcon(false);
   saveProgress(true);
   syncPlaybackState();
+  updatePositionState();     // 暂停后锁屏面板要停在这个位置，否则滑条会回跳到旧值
 });
 audio.addEventListener('ended', () => {
   if (current && !playbackCompleted()) {
@@ -860,12 +956,15 @@ audio.addEventListener('ended', () => {
     saveProgress(true);
     render();
   }
+  wantPlay = false;          // 这一集确实播完了，别再被前台恢复逻辑拉起来
   const next = nextEpisode();
   if (next) play(next);
   else setStatus('列表里没有可接着播的单集了');
 });
 audio.addEventListener('error', () => {
   if (!current || !audio.getAttribute('src')) return;
+  // 只是启动时摆回来的播放器、用户还没点播放：不重试，也别弹错误
+  if (!wantPlay) return;
   // 加载失败同样不跳集，交给重试
   scheduleResume('音频加载失败（code ' + (audio.error ? audio.error.code : '?') + '）');
 });
@@ -874,6 +973,12 @@ function updateTimes() {
   // 用 displayDuration()：媒体时长被截断/读不出来时退回 feed 声明的时长，
   // 免得时间轴显示成 "0:12 / 0:12" 这种假的总长
   $('plTime').textContent = fmtDur(audio.currentTime || 0) + ' / ' + fmtDur(displayDuration());
+}
+
+function updateSeekBar() {
+  const d = displayDuration();
+  const pos = isFinite(audio.currentTime) ? Math.max(audio.currentTime || 0, 0) : 0;
+  $('plSeek').value = d > 0 ? String(Math.round((pos / d) * 1000)) : '0';
 }
 
 function updateMediaSession(it) {
@@ -886,22 +991,52 @@ function updateMediaSession(it) {
   navigator.mediaSession.metadata = new MediaMetadata({
     title: it.e.t, artist: it.f.title, album: '播客', artwork: art,
   });
-  if (navigator.mediaSession.setActionHandler) {
-    const seekBy = (s) => { try { audio.currentTime = Math.max(0, audio.currentTime + s); } catch (_) {} };
-    navigator.mediaSession.setActionHandler('play', () => audio.play());
-    navigator.mediaSession.setActionHandler('pause', () => audio.pause());
-    navigator.mediaSession.setActionHandler('seekbackward', () => seekBy(-BACK_SEC));
-    navigator.mediaSession.setActionHandler('seekforward', () => seekBy(FWD_SEC));
-  }
+}
+
+// 锁屏/控制中心的按钮只在初始化时注册一次。注册在 play() 里也行，但那样
+// 后台恢复、页面被还原时都可能还没注册上；一次性注册覆盖所有场景。
+function setupMediaSession() {
+  if (!('mediaSession' in navigator)) return;
+  const on = (action, fn) => {
+    // 不支持的 action 会抛 NotSupportedError，别让一个失败拖垮后面的注册
+    try { navigator.mediaSession.setActionHandler(action, fn); } catch (_) {}
+  };
+  on('play', () => requestPlay());
+  on('pause', () => userPause());
+  on('seekbackward', (d) => seekBy(-((d && d.seekOffset) || BACK_SEC)));
+  on('seekforward', (d) => seekBy((d && d.seekOffset) || FWD_SEC));
+  // iOS 的锁屏进度条只认 seekto；没有它，拖动进度条完全没反应
+  on('seekto', (d) => {
+    if (d && isFinite(d.seekTime)) seekTo(d.seekTime);
+  });
+}
+
+// 把播放器界面摆到某一集（音源由调用方负责）
+function showPlayer(it) {
+  $('player').hidden = false;
+  $('plTitle').textContent = it.e.t;
+  $('plSub').textContent = it.f.title + ' · ' + fmtDate(it.e.p);
+  $('plImg').src = thumbUrl(it.e.i);
+  updateTimes();
+  updateSeekBar();
+  updateMediaSession(it);
+  render();
 }
 
 function play(it) {
   const same = !!(current && current.id === it.id);
-  if (same && !audio.paused) { audio.pause(); return; }
+  // 用意图判断而不是 audio.paused：后台/中断后元素可能 paused=false 却没声音，
+  // 按 paused 判断会把"点播放"变成"暂停"，于是怎么点都恢复不了。
+  if (same && wantPlay) { userPause(); return; }
 
   cancelResume();                          // 用户自己操作了，撤掉待执行的自动重试
   if (same) {
-    pendingSeek = null;                    // 同一个单集，接着播，别跳
+    // 同一个单集接着播，不重载、不跳位置（恢复出来的断点还在 pendingSeek 里）。
+    // 元素被系统清过 src / 停在错误状态时，先把源接回去。
+    if (!audio.getAttribute('src') || audio.error) {
+      audio.src = toLocal(it.e.u);
+      audio.load();
+    }
   } else {
     stallRetry = 0;                        // 换集：重试计数从头算
     stallFrom = 0;
@@ -912,25 +1047,24 @@ function play(it) {
   }
   current = it;
   audio.playbackRate = settings.speed;
+  writeLS(LS_CURRENT, { id: it.id });       // iOS 后台被回收后靠它把播放器摆回来
 
-  $('player').hidden = false;
-  $('plTitle').textContent = it.e.t;
-  $('plSub').textContent = it.f.title + ' · ' + fmtDate(it.e.p);
-  $('plImg').src = thumbUrl(it.e.i);
-  $('plSeek').value = '0';
-  updateTimes();
-  updateMediaSession(it);
-  render();
-
-  audio.play().catch(onPlayError);
+  showPlayer(it);
+  requestPlay();
 }
 
 // 快速切集 / 暂停会把上一次 play() 的 promise 以 AbortError 打断，这是正常现象，
 // 报了反而像出错。真正的失败（格式不支持、源 404）才提示。
 function onPlayError(err) {
   if (err && err.name === 'AbortError') return;
+  // 没真正开始播，就把意图清掉，否则按钮会卡在"暂停"、下一次点击又被当成暂停
+  wantPlay = false;
   // 已经排了重试就别覆盖 —— error 事件给出的提示（还能重试几次）比这句有用
   if (stallTimer) return;
+  if (err && err.name === 'NotAllowedError') {
+    setStatus('点播放继续');
+    return;
+  }
   setStatus('播放失败：' + ((err && err.message) || err));
 }
 
@@ -1068,20 +1202,18 @@ function applyTheme() {
 $('refresh').addEventListener('click', () => refresh(true));
 
 $('plPlay').addEventListener('click', () => {
-  cancelResume();
-  if (audio.paused) audio.play().catch(onPlayError);
-  else audio.pause();
+  if (wantPlay) userPause();
+  else requestPlay();
 });
-$('plBack').addEventListener('click', () => {
-  try { audio.currentTime = Math.max(0, audio.currentTime - BACK_SEC); } catch (_) {}
-});
-$('plFwd').addEventListener('click', () => {
-  try { audio.currentTime = Math.min(audio.duration || 1e9, audio.currentTime + FWD_SEC); } catch (_) {}
-});
+$('plBack').addEventListener('click', () => seekBy(-BACK_SEC));
+$('plFwd').addEventListener('click', () => seekBy(FWD_SEC));
 $('plClose').addEventListener('click', () => {
+  wantPlay = false;
+  cancelResume();
   saveProgress(true);
   audio.pause();
   try { audio.removeAttribute('src'); audio.load(); } catch (_) {}
+  writeLS(LS_CURRENT, null);       // 主动关掉播放器：下次启动不用再摆回来
   current = null;
   $('player').hidden = true;
   render();
@@ -1091,12 +1223,8 @@ const seek = $('plSeek');
 seek.addEventListener('input', () => { seeking = true; });
 seek.addEventListener('change', () => {
   const d = displayDuration();
-  if (d > 0) {
-    try { audio.currentTime = (Number(seek.value) / 1000) * d; } catch (_) {}
-  }
+  if (d > 0) seekTo((Number(seek.value) / 1000) * d);
   seeking = false;
-  cancelResume();                  // 用户自己定位了，撤掉待执行的自动重试
-  saveProgress(true);
 });
 
 $('plSpeed').addEventListener('click', () => {
@@ -1145,15 +1273,24 @@ $('doneBtn').addEventListener('click', () => {
   render();
 });
 
-// 切后台/关页面：落盘 + 推一次云端；回到前台顺手拉一次别的设备的新数据
+// 切后台/关页面：落盘 + 推一次云端；回到前台先补一下播放（系统可能在后台
+// 掐掉或中断过），再顺手拉一次别的设备的新数据。
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     saveProgress(true);
-  } else if (Date.now() - lastPull > PULL_EVERY) {
-    syncPull();
+    updatePositionState();
+  } else {
+    resumeIfNeeded();
+    if (Date.now() - lastPull > PULL_EVERY) syncPull();
   }
 });
+// iOS 的 PWA 从后台回来不一定触发 visibilitychange（页面可能整个被还原/进 bfcache），
+// 这两条一起兜住。
+window.addEventListener('pageshow', () => resumeIfNeeded());
+window.addEventListener('focus', () => resumeIfNeeded());
 window.addEventListener('pagehide', () => saveProgress(true));
+
+setupMediaSession();
 
 function syncToolbar() {
   $('sortBtn').textContent = settings.sortDesc ? '↓ 最新在前' : '↑ 最早在前';
@@ -1181,6 +1318,30 @@ function syncFeedSelect() {
     sel.appendChild(o);
   }
   sel.value = settings.feed;
+}
+
+// iOS 后台常把整个 PWA 回收掉，重开时内存里的 current 已经没了。
+// 按上次记住的单集把播放器摆回来（不自动播放，位置从进度里带出），
+// 用户点一下就能接着听。
+function restorePlayer() {
+  const saved = readLS(LS_CURRENT, null);
+  if (!saved || !saved.id || current) return;
+  let hit = null;
+  for (const f of feeds) {
+    for (const e of f.episodes) {
+      if (epId(f.id, e) === saved.id) { hit = { id: saved.id, e: e, f: f }; break; }
+    }
+    if (hit) break;
+  }
+  if (!hit) return;
+  current = hit;
+  const pr = progress[hit.id];
+  pendingSeek = pr && !isFinished(pr) && pr.p > 0 ? pr.p : null;
+  audio.src = toLocal(hit.e.u);
+  audio.load();
+  audio.playbackRate = settings.speed;
+  wantPlay = false;
+  showPlayer(hit);
 }
 
 /* ================= 启动 ================= */
@@ -1213,6 +1374,7 @@ async function boot() {
     syncPull();
   }
   syncFeedSelect();
+  restorePlayer();
 
   new IntersectionObserver((entries) => {
     if (entries.some((e) => e.isIntersecting)) renderMore();

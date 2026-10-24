@@ -3,7 +3,7 @@
 
 // 图标被 SW 缓存优先接管了（见下面 cacheFirst），所以换图标必须提版本号，
 // 否则已经装过 PWA 的客户端会一直用缓存里那套旧图。
-const VERSION = 'podcast-v3';
+const VERSION = 'podcast-v4';
 const SYNC_PATH = new URL('sync/', self.registration.scope).pathname;
 const ICONS_PATH = new URL('icons/', self.registration.scope).pathname;
 const THUMB_PATH = new URL('thumb', self.registration.scope).pathname;
@@ -79,8 +79,12 @@ self.addEventListener('fetch', (e) => {
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return; // 封面图等第三方资源不拦
 
-  // 音频不拦截：Range 请求交给浏览器原生处理，SW 插一脚会打断拖动跳转
-  if (req.destination === 'audio' || /\.mp3$/i.test(url.pathname)) return;
+  // 音频不拦截：Range 请求交给浏览器原生处理，SW 插一脚会打断拖动跳转。
+  // WebKit 上 request.destination 不一定拿得到，再按扩展名和 Range 头兜一层 ——
+  // 只要放行了 .wav（本地 TTS）这类没有 .mp3 后缀的音频，后台播放和拖动才不会断。
+  if (req.destination === 'audio'
+      || req.headers.has('range')
+      || /\.(mp3|m4a|aac|wav|flac|ogg|oga|opus|mp4)$/i.test(url.pathname)) return;
 
   // 同步接口完全不碰：一是不能进缓存（否则可能拿到旧进度），
   // 二是不必让 SW 挡在中间转一手 —— 它只是即时的一来一回读写。

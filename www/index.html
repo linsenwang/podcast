@@ -56,6 +56,12 @@
 </main>
 <div id="empty" class="empty" hidden></div>
 
+<!-- 媒体元素必须真实存在于文档里：iOS「添加到主屏幕」的 PWA 切到后台时，
+     脱离文档的 new Audio() 会被系统挂起/掐掉 —— 音频停、锁屏面板消失，
+     前后跳和暂停后再播也一起失效。放在 footer 外面，免得播放器收起时
+     footer 的 hidden 把媒体元素一起藏掉。 -->
+<audio id="player-audio" preload="metadata"></audio>
+
 <footer id="player" class="player" hidden>
   <div class="pl-top">
     <img id="plImg" class="pl-img" alt="" referrerpolicy="no-referrer">
