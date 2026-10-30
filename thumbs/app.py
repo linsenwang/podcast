@@ -43,7 +43,7 @@ MAX_FETCH_BYTES = 12 * 1024 * 1024   # 上游异常大图直接放弃，别把�
 
 # SSRF 白名单：只放行这几家图床。用"域名后缀"而不是完整主机名，
 # 因为同一家图床的 CNAME 会变（i0/i1/i2.hdslb.com、i.ytimg.com / img.youtube.com 等）。
-ALLOWED_DOMAINS = ('hdslb.com', 'ytimg.com', 'ggpht.com')
+ALLOWED_DOMAINS = ('hdslb.com', 'ytimg.com', 'ggpht.com', 'fireside.fm')
 
 # 缩略图内容由 URL 唯一决定，所以就按 URL 做 immutable；前端也因此可以直接长缓存。
 CACHE_CONTROL_HIT = 'public, max-age=31536000, immutable'

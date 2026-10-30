@@ -329,6 +329,7 @@ let view = [];           // 当前可见条目（已排序）
 let rendered = 0;
 let current = null;      // 正在播放的条目
 let refreshing = false;
+let progressRenderTimer = 0; // 刷新过程中按 feed 逐个重绘的节流句柄
 const bars = new Map();  // 单集 id -> 进度条 <i>
 
 /* ================= 小工具 ================= */
@@ -461,6 +462,12 @@ async function loadIndex() {
   // 服务没起来时只是这一项刷新失败，不影响其他订阅。
   const ttsFeed = new URL('tts/feed.xml', document.baseURI).href;
   list.push({ id: 'tts', title: '本地 TTS', xmlUrl: ttsFeed, url: ttsFeed });
+
+  // 晚点聊 LateTalk：外部 RSS，源站不带 CORS 头，跨源 fetch 会被浏览器拦掉，
+  // 所以走 podcast 的 nginx 同源反代（见 nginx.conf 的 /latepost/rss）。
+  // 单集音频是 https 直链，<audio> 跨源播放不需要 CORS。
+  const latepost = new URL('latepost/rss', document.baseURI).href;
+  list.push({ id: 'latepost', title: '晚点聊 LateTalk', xmlUrl: latepost, url: latepost });
   return list;
 }
 
@@ -500,6 +507,7 @@ async function refresh(force) {
     // 并发 8：链路是 HTTP/2（tailscale serve 协商出来的），多路复用，
     // 所以不受浏览器"单域名 6 连接"的限制，开高一点能明显缩短等待。
     await pool(stale, 8, async (f) => {
+      let updated = false;   // 只有这个 feed 真的多了新单集才重绘
       try {
         // feed 大部分时候没变，带上 If-Modified-Since 就能只收一个 304 ——
         // 不但省掉整个体的下载，连 DOMParser 和重建对象都省了
@@ -513,7 +521,11 @@ async function refresh(force) {
           unchanged++;
         } else {
           if (!res.ok) throw new Error('HTTP ' + res.status);
-          f.episodes = parseFeed(await res.text());
+          // 上游经常回 200 但内容没变，逐个比较 guid 才知道到底有没有新单集
+          const seen = new Set(f.episodes.map((e) => e.g || e.u));
+          const episodes = parseFeed(await res.text());
+          updated = episodes.some((e) => !seen.has(e.g || e.u));
+          f.episodes = episodes;
           f.fetchedAt = Date.now();
           f.lastModified = res.headers.get('Last-Modified') || f.lastModified || '';
           f.error = '';
@@ -526,8 +538,11 @@ async function refresh(force) {
         failed++;
       }
       setStatus('更新 ' + (++done) + '/' + stale.length);
+      if (updated) renderSoon();   // 有更新就立刻让它冒出来，不等其它源
     });
 
+    clearTimeout(progressRenderTimer);
+    progressRenderTimer = 0;
     pruneProgress();
     render();
     const stamp = new Date().toTimeString().slice(0, 5);
@@ -677,6 +692,24 @@ function render() {
         : '这里没有单集。';
     }
   }
+}
+
+// 刷新过程中每完成一个 feed 就重绘一次：30+ 个源是并发拉的，等全部结束再
+// 一次性出结果要空转十几秒。节流到 300ms，既不会每个 feed 都重建整张列表，
+// 又能看到单集陆续冒出来。重绘会重建 DOM，先把滚动位置记下来再放回去。
+function renderSoon() {
+  if (progressRenderTimer) return;
+  progressRenderTimer = setTimeout(() => {
+    progressRenderTimer = 0;
+    renderKeepScroll();
+  }, 300);
+}
+
+function renderKeepScroll() {
+  const list = $('list');
+  const top = list.scrollTop;
+  render();
+  list.scrollTop = top;
 }
 
 function renderMore() {
