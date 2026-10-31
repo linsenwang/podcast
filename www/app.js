@@ -463,11 +463,18 @@ async function loadIndex() {
   const ttsFeed = new URL('tts/feed.xml', document.baseURI).href;
   list.push({ id: 'tts', title: '本地 TTS', xmlUrl: ttsFeed, url: ttsFeed });
 
-  // 晚点聊 LateTalk：外部 RSS，源站不带 CORS 头，跨源 fetch 会被浏览器拦掉，
-  // 所以走 podcast 的 nginx 同源反代（见 nginx.conf 的 /latepost/rss）。
+  // 外部 Fireside 源：源站不带 CORS 头，跨源 fetch 会被浏览器拦掉，
+  // 统一走 podcast 的 nginx 同源反代（见 nginx.conf 的 /<id>/rss）。
   // 单集音频是 https 直链，<audio> 跨源播放不需要 CORS。
-  const latepost = new URL('latepost/rss', document.baseURI).href;
-  list.push({ id: 'latepost', title: '晚点聊 LateTalk', xmlUrl: latepost, url: latepost });
+  const external = [
+    ['latepost', '晚点聊 LateTalk'],
+    ['fuyoutiandi', '蜉蝣天地 Meanders'],
+    ['shanyouhu', '山有虎'],
+  ];
+  for (const [id, title] of external) {
+    const u = new URL(id + '/rss', document.baseURI).href;
+    list.push({ id, title, xmlUrl: u, url: u });
+  }
   return list;
 }
 
@@ -770,6 +777,17 @@ let stallFrom = 0;
 // 之后点播放反而执行 pause，于是"暂停了再也回不来"。
 let wantPlay = false;
 
+// iOS 的 <audio> 一旦自然播完（ended），WebKit 会关掉本页的 audio session：
+// 前台还能重新 play()，后台会被直接拒绝，锁屏/控制中心的按钮随之全部失灵。
+// 让元素永远 loop，在它回卷到 0 的那一刻同步切下一集 —— 没有 ended，
+// session 就不会被关掉（WebKit bug 261858 / 243258）。
+audio.loop = true;
+let lastTime = 0;          // 上一次 timeupdate 的位置，用来识别"回卷"
+let manualSeekAt = 0;      // 本页主动定位的时间，别把拖动误判成自然播完
+let seekNearEnd = false;   // 用户主动拖到了结尾附近，这次的"回卷"算播完
+let wrapping = false;      // 正在切下一集，防止 seeking/timeupdate 重复触发
+let needReload = false;    // 断流后元素停在截断的结尾，下次播放必须先 load()
+
 const STALL_RETRY_MAX = 3;
 const STALL_WAIT_MS = 5000;          // 第 n 次重试等 n*5 秒
 
@@ -804,12 +822,34 @@ function isMediaAlive() {
   return !audio.error && audio.readyState >= 2;
 }
 
+// iOS 16.4+ 的 Audio Session API：显式声明"这是媒体播放"，系统才按播放类
+// 应用处理音频路由和后台生命周期。必须在用户手势的同步路径里设置，
+// 不支持这个 API 的浏览器直接跳过。
+function armAudioSession() {
+  try {
+    if (navigator.audioSession) navigator.audioSession.type = 'playback';
+  } catch (_) {}
+}
+
+// 当前位置是不是"从结尾回卷到了开头"。用户自己拖进度条不算：
+// seekTo() 会先记 manualSeekAt，由 seeking/seeked 两个事件兜住。
+function maybeWrapped(from, to) {
+  if (wrapping || !current) return false;
+  if (Date.now() - manualSeekAt < 1500 && !seekNearEnd) return false;
+  return isFinite(from) && isFinite(to)
+    && from > 3 && to < 1.5 && from - to > 2;
+}
+
 // 重新走一遍资源选择，再定位回断点播放。
 // 后台被系统挂起/中断之后，元素可能停在"请求过播放但没有任何数据"甚至 error 的状态，
 // 这时光调 play() 不会重新拉流，必须 load()。
 function reloadAt(pos) {
   if (!current) return;
   pendingSeek = pos > 0 ? pos : null;
+  audio.loop = true;
+  needReload = false;
+  lastTime = 0;
+  seekNearEnd = false;
   audio.src = toLocal(current.e.u);
   audio.load();
   audio.playbackRate = settings.speed;
@@ -820,11 +860,16 @@ function reloadAt(pos) {
 // 想继续播（锁屏播放键、回来点播放、从后台恢复）都走这里
 function requestPlay() {
   if (!current) return;
+  armAudioSession();                   // 必须在手势里、play() 之前
   cancelResume();                      // 用户/系统主动操作了，撤掉待执行的自动重试
   wantPlay = true;
   audio.playbackRate = settings.speed;
-  if (audio.error) {                   // 上次加载失败过：直接 play() 救不回来
-    reloadAt(audio.currentTime || (progress[current.id] && progress[current.id].p) || 0);
+  const at = audio.currentTime > 0
+    ? audio.currentTime
+    : ((progress[current.id] && progress[current.id].p) || 0);
+  // 上次加载失败、系统把 src 清掉了、或断流停在截断的结尾：直接 play() 救不回来
+  if (!audio.getAttribute('src') || audio.error || needReload) {
+    reloadAt(at);
     return;
   }
   audio.play().catch(onPlayError);
@@ -848,6 +893,47 @@ function resumeIfNeeded() {
     ? audio.currentTime
     : ((progress[current.id] && progress[current.id].p) || 0);
   reloadAt(at);
+}
+
+// loop 回卷到 0：这不是用户拖动，可能是真的播完了，也可能是网络断流时
+// 浏览器把"已缓冲的末尾"当成整个音频的结尾。必须在这个事件里同步处理，
+// 不能丢给 setTimeout —— 后台的定时器会被冻住。
+function onTrackWrapped() {
+  if (!current || wrapping) return;
+  wrapping = true;
+  try {
+    const id = current.id;
+    // 时长明显短于 feed 声明 → 断流，不是完播：停下来等网络恢复后从断点重试。
+    if (!mediaDurationOk()) {
+      try { audio.pause(); } catch (_) {}
+      audio.loop = false;            // 别让 seek 回断点时又触发一次回卷
+      needReload = true;             // 下次 play() 必须重新 load，回到断点
+      const at = Math.max((progress[id] && progress[id].p) || 0, lastTime || 0);
+      try { manualSeekAt = Date.now(); audio.currentTime = at; } catch (_) {}
+      scheduleResume('音频被网络中断');
+      return;
+    }
+    const d = audio.duration;
+    touchProgress(id, { p: d, d: d });
+    setFinished(id, true);
+    saveProgress(true);
+    const next = nextEpisode();
+    if (next) {
+      play(next);                   // play() 里先 pause 再换源，session 不会被关
+      return;
+    }
+    wantPlay = false;
+    try { audio.pause(); } catch (_) {}
+    if (d > 0) {
+      // 停在结尾附近，别让 loop 把界面又拽回 0:00
+      try { manualSeekAt = Date.now(); audio.currentTime = Math.max(0, d - 0.5); } catch (_) {}
+    }
+    setStatus('列表里没有可接着播的单集了');
+    render();
+  } finally {
+    wrapping = false;
+    seekNearEnd = false;
+  }
 }
 
 // 断流不跳集，改成从断点重试拉流（退避重试，最多 3 次）
@@ -875,6 +961,7 @@ function scheduleResume(reason) {
 audio.addEventListener('loadedmetadata', () => {
   audio.playbackRate = settings.speed;
   if (pendingSeek != null) {
+    manualSeekAt = Date.now();       // 这是本页恢复断点，不是自然播完
     try { audio.currentTime = pendingSeek; } catch (_) {}
     pendingSeek = null;
   }
@@ -890,15 +977,26 @@ audio.addEventListener('loadedmetadata', () => {
   updatePositionState();
 });
 
+// loop 回卷时先改 currentTime 再发事件，seeking / timeupdate 哪个先到都接住。
+// 两处都只认 maybeWrapped()，用户拖动由 manualSeekAt 排除。
+audio.addEventListener('seeking', () => {
+  if (maybeWrapped(lastTime, audio.currentTime)) onTrackWrapped();
+});
+audio.addEventListener('seeked', () => {
+  lastTime = audio.currentTime;      // 手动定位后同步基准，避免下次误判
+});
+
 audio.addEventListener('timeupdate', () => {
   if (!current || !audio.duration) return;
+  if (maybeWrapped(lastTime, audio.currentTime)) { onTrackWrapped(); return; }
+  lastTime = audio.currentTime;
   const d = displayDuration();
   if (!d) return;
   if (!seeking) updateSeekBar();
   updateTimes();
 
   touchProgress(current.id, { p: audio.currentTime, d: d });
-  // 时长可信时才判断完播：断流造成的假 ended 不能落成完播记录。
+  // 时长可信时才判断完播：断流造成的假结尾不能落成完播记录。
   // setFinished 只在 0->1 那一次记完播时间 c，所以重复调用不会把 c 冲成"最后一次写入时间"。
   if (mediaDurationOk() && audio.currentTime / audio.duration >= DONE_RATIO) setFinished(current.id, true);
   saveProgress(false);
@@ -936,7 +1034,10 @@ function seekTo(t) {
   if (!current || !isFinite(t)) return;
   t = Math.max(0, t);
   const d = displayDuration();
-  if (d > 0) t = Math.min(t, d);
+  // 不要正好拖到 duration：loop 下会被当成回卷，自动跳到下一集。
+  if (d > 0) t = Math.min(t, Math.max(0, d - 0.5));
+  seekNearEnd = d > 0 && t >= d - 1;  // 拖到结尾附近：这次的"回卷"按播完处理
+  manualSeekAt = Date.now();          // 标记成本页主动定位，别被识别成自然播完
   if (audio.readyState >= 1) {
     try { audio.currentTime = t; } catch (_) {}
   } else {
@@ -965,11 +1066,19 @@ function setPlayIcon(playing) {
   $('plPlay').setAttribute('aria-label', playing ? '暂停' : '播放');
 }
 audio.addEventListener('play', () => {
+  if (current) wantPlay = true;    // 系统默认控件直接 play() 时也把意图接回来
   setPlayIcon(true);
   syncPlaybackState();
 });
 audio.addEventListener('playing', () => {
   cancelResume();                  // 自己缓冲好了，不用再重试
+  armAudioSession();
+  // iOS 会忽略"媒体真正开始播放之前"注册的 MediaSession handler，
+  // 所以每次进入 playing 都重新注册一遍（成本几乎为零），
+  // 锁屏的播放/暂停、±10/30 秒和 seekto 才会真的响应。
+  setupMediaSession();
+  if (current) updateMediaSession(current);
+  syncPlaybackState();
   const st = $('status').textContent;
   if (st.slice(0, 4) === '播放失败' || st.indexOf('重试') >= 0) setStatus('');
 });
@@ -1033,8 +1142,9 @@ function updateMediaSession(it) {
   });
 }
 
-// 锁屏/控制中心的按钮只在初始化时注册一次。注册在 play() 里也行，但那样
-// 后台恢复、页面被还原时都可能还没注册上；一次性注册覆盖所有场景。
+// 锁屏/控制中心的按钮。启动时先注册一次，之后每次 playing 再注册一遍：
+// iOS 只认媒体进入 Now Playing 之后注册的 handler，只在启动时注册等于没注册。
+// 重复 setActionHandler 是幂等的，代价可以忽略。
 function setupMediaSession() {
   if (!('mediaSession' in navigator)) return;
   const on = (action, fn) => {
@@ -1070,6 +1180,13 @@ function play(it) {
   if (same && wantPlay) { userPause(); return; }
 
   cancelResume();                          // 用户自己操作了，撤掉待执行的自动重试
+  audio.pause();                           // 换源前先 pause：iOS 只有自然 ended 才关 session
+  audio.loop = true;
+  needReload = false;
+  lastTime = 0;
+  manualSeekAt = 0;
+  seekNearEnd = false;
+  wrapping = false;
   if (same) {
     // 同一个单集接着播，不重载、不跳位置（恢复出来的断点还在 pendingSeek 里）。
     // 元素被系统清过 src / 停在错误状态时，先把源接回去。
@@ -1381,14 +1498,19 @@ document.addEventListener('visibilitychange', () => {
     saveProgress(true);
     updatePositionState();
   } else {
-    resumeIfNeeded();
+    onForeground();
     if (Date.now() - lastPull > PULL_EVERY) syncPull();
   }
 });
 // iOS 的 PWA 从后台回来不一定触发 visibilitychange（页面可能整个被还原/进 bfcache），
-// 这两条一起兜住。
-window.addEventListener('pageshow', () => resumeIfNeeded());
-window.addEventListener('focus', () => resumeIfNeeded());
+// 这两条一起兜住。系统也可能在后台丢掉 MediaSession 的 handler，一并补注册。
+function onForeground() {
+  setupMediaSession();
+  armAudioSession();
+  resumeIfNeeded();
+}
+window.addEventListener('pageshow', onForeground);
+window.addEventListener('focus', onForeground);
 window.addEventListener('pagehide', () => saveProgress(true));
 
 setupMediaSession();

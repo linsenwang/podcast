@@ -3,7 +3,7 @@
 
 // 图标被 SW 缓存优先接管了（见下面 cacheFirst），所以换图标必须提版本号，
 // 否则已经装过 PWA 的客户端会一直用缓存里那套旧图。
-const VERSION = 'podcast-v4';
+const VERSION = 'podcast-v5';
 const SYNC_PATH = new URL('sync/', self.registration.scope).pathname;
 const ICONS_PATH = new URL('icons/', self.registration.scope).pathname;
 const THUMB_PATH = new URL('thumb', self.registration.scope).pathname;
