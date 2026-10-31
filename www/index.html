@@ -37,12 +37,11 @@
 <header class="top">
   <div class="top-right">
     <span id="status" class="status"></span>
-    <button id="theme" class="icon-btn" title="主题"><span id="themeIco" class="ico ico-auto"></span></button>
-    <button id="refresh" class="icon-btn" title="刷新全部订阅" aria-label="刷新"><span class="ico ico-refresh"></span></button>
   </div>
 </header>
 
 <div class="toolbar">
+  <button id="theme" class="icon-btn" title="主题"><span id="themeIco" class="ico ico-auto"></span></button>
   <select id="feedSel" aria-label="选择订阅源"></select>
   <!-- 排序 / 隐藏已完播 / 最近完播收进一个下拉，点「筛选」才展开 -->
   <div class="filter-wrap">
@@ -53,6 +52,7 @@
       <button id="doneBtn" class="chip" type="button" role="switch" aria-checked="false">最近完播</button>
     </div>
   </div>
+  <button id="refresh" class="icon-btn" title="刷新全部订阅" aria-label="刷新"><span class="ico ico-refresh"></span></button>
 </div>
 
 <main id="list" class="list" aria-live="polite">

@@ -637,9 +637,13 @@ function rowEl(it) {
   const meta = document.createElement('div');
   meta.className = 'ep-meta';
   // 「最近完播」视图里显示完播时间 —— 列表就是按它排的
-  meta.textContent = it.f.title + ' · '
+  // meta.textContent = it.f.title + ' · '
+  //   + (settings.doneView ? '完播于 ' + fmtDate(it.c) : fmtDate(it.e.p))
+  //   + (it.e.d ? ' · ' + fmtDur(it.e.d) : '');
+
+  meta.textContent = it.f.title + '  '
     + (settings.doneView ? '完播于 ' + fmtDate(it.c) : fmtDate(it.e.p))
-    + (it.e.d ? ' · ' + fmtDur(it.e.d) : '');
+    + (it.e.d ? '  ' + fmtDur(it.e.d) : '');
 
   const title = document.createElement('div');
   title.className = 'ep-title';
@@ -1165,7 +1169,7 @@ function setupMediaSession() {
 function showPlayer(it) {
   $('player').hidden = false;
   $('plTitle').textContent = it.e.t;
-  $('plSub').textContent = it.f.title + ' · ' + fmtDate(it.e.p);
+  $('plSub').textContent = it.f.title + '  ' + fmtDate(it.e.p);
   $('plImg').src = thumbUrl(it.e.i);
   updateTimes();
   updateSeekBar();
