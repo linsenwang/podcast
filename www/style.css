@@ -23,6 +23,9 @@
   --btn-height: 36px;
   --main-font-size: 15px;
   --dim-font-size: 10px;
+  --panel-glass: rgba(23, 26, 33, .72);  /* 毛玻璃底色，@supports 不支持时退回 --panel */
+  --player-h: 0px;                       /* 播放器实际高度，由 app.js 量出来写进来 */
+  --top-h: 0px;                          /* 顶栏浮层高度，同上 */
 }
 
 :root[data-theme="light"] {
@@ -41,6 +44,7 @@
   --done-off: #c3c9d4;
   --on-accent: #fff;
   --accent-active: #2a62cf;
+  --panel-glass: rgba(255, 255, 255, .72);
 }
 
 * { box-sizing: border-box; }
@@ -87,7 +91,24 @@ body {
 
 button { font: inherit; color: inherit; cursor: pointer; }
 
-/* ---------- 顶栏 ---------- */
+/* ---------- 顶栏 + 过滤栏（一个 fixed 毛玻璃浮层） ---------- */
+/* 列表是独立滚动容器，顶栏只要留在文档流里就永远压不到内容上，
+   backdrop-filter 找不到背后的东西。所以把两栏一起 fixed 在顶上。 */
+.bars {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  background: var(--panel-glass);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  backdrop-filter: blur(14px) saturate(1.2);
+  transform: translateZ(0);   /* iOS 滚动时模糊实时重绘，理由同 .player */
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .bars { background: var(--panel); }
+}
+
 .top {
   display: flex;
   align-items: center;
@@ -95,9 +116,11 @@ button { font: inherit; color: inherit; cursor: pointer; }
   gap: 10px;
   /* padding: calc(10px + env(safe-area-inset-top)) var(--space-inline) 0; */
   padding: 0 var(--space-inline);
-  padding-top: 4px;
+  padding-top: 6px;
   /* border-bottom: 1px solid var(--line); */
-  background: var(--panel);
+  /* 状态文字是启动后才填进来的，空着时也占住一行（6px 上边距 + 10px * 1.45 行高），
+     否则 --top-h 会在文字出现前量小，列表第一行钻到浮层底下 */
+  min-height: calc(6px + 1.45 * 10px);
 }
 .top-right { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .status { font-size: var(--dim-font-size); color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -147,7 +170,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
   padding: 9px var(--space-inline);
   padding-top: 6px;
   /* border-bottom: 1px solid var(--line); */
-  background: var(--panel);
+  /* 底色交给外层 .bars，这里保持透明，两栏才是一整块玻璃 */
 }
 .toolbar select {
   flex: 1 1 auto;
@@ -206,7 +229,15 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .chip.on { border-color: var(--accent); color: var(--fg); background: var(--sel); }
 
 /* ---------- 单集列表 ---------- */
-.list { flex: 1 1 auto; overflow-y: auto; -webkit-overflow-scrolling: touch; padding-top: calc(var(--space-inline) * 0.4);}
+/* 上下两条浮层（.bars / .player）都浮在列表上：列表内容从底下滚过，毛玻璃
+   才有东西可模糊。留出两条浮层的高度（--top-h / --player-h 由 app.js 量）以免遮挡内容。 */
+.list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding-top: calc(var(--top-h));
+  padding-bottom: var(--player-h);
+}
 
 .ep {
   display: grid;
@@ -219,12 +250,16 @@ button { font: inherit; color: inherit; cursor: pointer; }
   /* border-bottom: 1px solid var(--line); */
   min-height: 72px;
 }
-.ep.playing { background: var(--playing); }
+/* 正在播的那行：从透明渐变到 --playing，顶部和相邻行衔接得自然些 */
+/* .ep.playing { background: linear-gradient(to bottom, transparent, var(--playing)); border-radius: 0 0 16px 16px;} */
+/* .ep.playing { background: var(--playing); border-radius: 0 0 16px 16px;} */
+.ep.playing { background: var(--playing);}
 .ep-img {
   width: 78px;
   height: 52px;
   border-radius: 8px;
-  background: var(--panel2);
+  border: 1px var(--panel2) solid;
+  background: var(--panel);
   object-fit: cover;
   display: block;
 }
@@ -269,11 +304,22 @@ button { font: inherit; color: inherit; cursor: pointer; }
 
 /* ---------- 播放器 ---------- */
 .player {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 20;
   border-top: 1px solid var(--line);
-  /* background: var(--panel); */
-  background: rgba(0, 0, 0, 0);
   padding: 10px var(--space-inline) calc(10px + env(safe-area-inset-bottom));
-  backdrop-filter: blur(5px);
+  background: var(--panel-glass);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  backdrop-filter: blur(14px) saturate(1.2);
+  /* iOS 上不单独提成合成层时，列表滚动过程中模糊层不会跟着重绘，会一直糊着旧内容 */
+  transform: translateZ(0);
+}
+/* 老浏览器/关掉模糊的设备：直接给不透明底色，别让文字压在列表上 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .player { background: var(--panel); }
 }
 .pl-top { display: grid; grid-template-columns: 60px 1fr auto; gap: 10px; align-items: center; }
 .pl-img { width: 60px; height: 40px; border-radius: 7px; background: var(--panel2); object-fit: cover; display: block; }
@@ -281,10 +327,55 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .pl-title { font-size: var(--main-font-size); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pl-sub { font-size: var(--dim-font-size); color: var(--dim); white-space: pre-wrap; overflow: hidden; text-overflow: ellipsis; }
 
-.pl-seek { width: 100%; margin: 4px 0; accent-color: var(--accent); }
+/* ---------- 进度条（自绘） ---------- */
+/* 不用原生 accent-color：各端轨道的粗细/圆角/拖柄大小都不一样。这里统一成
+   4px 轨道 + 12px 拖柄，已播部分靠 --pct（由 app.js 更新）在轨道上涂色。 */
+.pl-seek {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 20px;
+  margin: 4px 0;
+  padding: 0;
+  background: transparent;
+  --pct: 0%;
+  cursor: pointer;
+}
+.pl-seek::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(to right, var(--accent) 0 var(--pct), var(--track) var(--pct) 100%);
+}
+.pl-seek::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  margin-top: -4px;                /* (轨道 4 - 拖柄 12) / 2 */
+  border: 0;
+  border-radius: 50%;
+  background: var(--on-accent);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .45);
+}
+.pl-seek:active::-webkit-slider-thumb { transform: scale(1.15); }
+
+/* Firefox 的已播进度是单独的伪元素，不用 --pct */
+.pl-seek::-moz-range-track { height: 4px; border-radius: 2px; background: var(--track); }
+.pl-seek::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--accent); }
+.pl-seek::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--on-accent);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .45);
+}
+
+.pl-seek:focus-visible { outline: none; }
+.pl-seek:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 4px var(--sel); }
 
 .pl-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.pl-time { font-size: 11.5px; color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pl-time { font-size: var(--main-font-size); color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .pl-btns { display: flex; align-items: center; gap: 8px; }
 
 .play-btn {

@@ -773,6 +773,7 @@ if ('webkitPreservesPitch' in audio) audio.webkitPreservesPitch = true;
 
 let pendingSeek = null;
 let seeking = false;
+let seekRaf = 0;           // 播放中推进进度条的 rAF 句柄（见 startSeekTicker）
 let stallTimer = 0;
 let stallRetry = 0;
 let stallFrom = 0;
@@ -1073,6 +1074,7 @@ audio.addEventListener('play', () => {
   if (current) wantPlay = true;    // 系统默认控件直接 play() 时也把意图接回来
   setPlayIcon(true);
   syncPlaybackState();
+  startSeekTicker();
 });
 audio.addEventListener('playing', () => {
   cancelResume();                  // 自己缓冲好了，不用再重试
@@ -1087,12 +1089,15 @@ audio.addEventListener('playing', () => {
   if (st.slice(0, 4) === '播放失败' || st.indexOf('重试') >= 0) setStatus('');
 });
 audio.addEventListener('pause', () => {
+  stopSeekTicker();
+  updateSeekBar();           // 停在准确位置，别留最后一帧
   setPlayIcon(false);
   saveProgress(true);
   syncPlaybackState();
   updatePositionState();     // 暂停后锁屏面板要停在这个位置，否则滑条会回跳到旧值
 });
 audio.addEventListener('ended', () => {
+  stopSeekTicker();
   if (current && !playbackCompleted()) {
     // 网络断流被当成"播完"了：记下位置，不标完播、不跳集，改成等网络恢复续播
     touchProgress(current.id, {
@@ -1131,7 +1136,39 @@ function updateTimes() {
 function updateSeekBar() {
   const d = displayDuration();
   const pos = isFinite(audio.currentTime) ? Math.max(audio.currentTime || 0, 0) : 0;
-  $('plSeek').value = d > 0 ? String(Math.round((pos / d) * 1000)) : '0';
+  paintSeek(pos, d);
+}
+
+// 值没变就不碰 DOM：长音频里 1000 级刻度每帧只走一小格，没必要重绘轨道
+function paintSeek(pos, d) {
+  const v = d > 0 ? String(Math.round((pos / d) * 1000)) : '0';
+  const seek = $('plSeek');
+  if (seek.value === v) return;
+  seek.value = v;
+  setSeekFill(Number(v) / 10);
+}
+
+// 自绘进度条靠 --pct 涂出已播部分（见 style.css 的 .pl-seek）
+function setSeekFill(pct) {
+  $('plSeek').style.setProperty('--pct', Math.min(100, Math.max(0, pct)) + '%');
+}
+
+/* 播放中进度条按屏幕刷新率推进：timeupdate 只有 ~4Hz，只靠它拖柄是一跳一跳的
+   （短音频尤其明显，一次就是好几格）。暂停、拖动、切集时停掉，
+   位置由 timeupdate / seeked 兜底。 */
+function tickSeek() {
+  seekRaf = 0;
+  if (audio.paused || audio.ended || seeking || !current) return;
+  updateSeekBar();
+  seekRaf = requestAnimationFrame(tickSeek);
+}
+function startSeekTicker() {
+  if (!seekRaf) seekRaf = requestAnimationFrame(tickSeek);
+}
+function stopSeekTicker() {
+  if (!seekRaf) return;
+  cancelAnimationFrame(seekRaf);
+  seekRaf = 0;
 }
 
 function updateMediaSession(it) {
@@ -1165,9 +1202,26 @@ function setupMediaSession() {
   });
 }
 
+// 播放器是 fixed 浮在列表上方（见 style.css 的 .player），列表底部要留出它的高度，
+// 否则最后一条会被盖住。倍速编辑面板展开/收起会改高度，用 ResizeObserver 跟着量。
+function syncPlayerInset() {
+  const p = $('player');
+  document.documentElement.style.setProperty('--player-h', (p.hidden ? 0 : p.offsetHeight) + 'px');
+}
+if (window.ResizeObserver) new ResizeObserver(syncPlayerInset).observe($('player'));
+
+// 顶栏 + 工具栏合并成的 .bars 也是 fixed 浮层，列表顶部同样要让出它的高度
+function syncBarsInset() {
+  const b = $('bars');
+  document.documentElement.style.setProperty('--top-h', (b ? b.offsetHeight : 0) + 'px');
+}
+if (window.ResizeObserver) new ResizeObserver(syncBarsInset).observe($('bars'));
+syncBarsInset();   // 首次量一遍，别等 ResizeObserver 的异步回调
+
 // 把播放器界面摆到某一集（音源由调用方负责）
 function showPlayer(it) {
   $('player').hidden = false;
+  syncPlayerInset();
   $('plTitle').textContent = it.e.t;
   $('plSub').textContent = it.f.title + '  ' + fmtDate(it.e.p);
   $('plImg').src = thumbUrl(it.e.i);
@@ -1363,10 +1417,12 @@ function openSpeedEdit() {
   $('speedInput').value = settings.speeds.join(', ');
   $('speedErr').textContent = '';
   $('speedEdit').hidden = false;
+  syncPlayerInset();
   $('speedInput').focus();
 }
 function closeSpeedEdit() {
   $('speedEdit').hidden = true;
+  syncPlayerInset();
 }
 
 function parseSpeeds(text) {
@@ -1433,15 +1489,21 @@ $('plClose').addEventListener('click', () => {
   writeLS(LS_CURRENT, null);       // 主动关掉播放器：下次启动不用再摆回来
   current = null;
   $('player').hidden = true;
+  syncPlayerInset();
   render();
 });
 
 const seek = $('plSeek');
-seek.addEventListener('input', () => { seeking = true; });
+seek.addEventListener('input', () => {
+  seeking = true;
+  // 拖动时 value 先动、timeupdate 还没到：涂色跟着手指走，别等音频
+  setSeekFill(Number(seek.value) / 10);
+});
 seek.addEventListener('change', () => {
   const d = displayDuration();
   if (d > 0) seekTo((Number(seek.value) / 1000) * d);
   seeking = false;
+  startSeekTicker();          // 拖动期间 rAF 停了，松手后接着平滑推进
 });
 
 // 点速度数字弹出预设菜单；点页面别处收起
