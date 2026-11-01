@@ -1183,7 +1183,7 @@ function updateMediaSession(it) {
   const art = [];
   // 用缩略图：MediaMetadata 的图走 CORS 拉取，同源的缩略图一定能过，
   // 而且不用为了锁屏去拉一张上百 KB 的原图
-  const img = thumbUrl(it.e.i);
+  const img = thumbUrl(it.e.i) || COVER_FALLBACK;
   if (img) art.push({ src: img, sizes: '200x200' });
   navigator.mediaSession.metadata = new MediaMetadata({
     title: it.e.t, artist: it.f.title, album: '播客', artwork: art,
@@ -1225,13 +1225,21 @@ function syncBarsInset() {
 if (window.ResizeObserver) new ResizeObserver(syncBarsInset).observe($('bars'));
 syncBarsInset();   // 首次量一遍，别等 ResizeObserver 的异步回调
 
+// 播放器封面是常驻元素，换集会反复改 src，所以错误回退得一直挂着。
+// feed 里给的封面地址可能根本不存在（本地 TTS 的 /tts/cover.jpg 就是），
+// 加载失败就退回 PWA 图标，别让播放器左上角空一块。
+const plImg = $('plImg');
+plImg.addEventListener('error', () => {
+  if (plImg.src !== COVER_FALLBACK) plImg.src = COVER_FALLBACK;
+});
+
 // 把播放器界面摆到某一集（音源由调用方负责）
 function showPlayer(it) {
   $('player').hidden = false;
   syncPlayerInset();
   $('plTitle').textContent = it.e.t;
   $('plSub').textContent = it.f.title + '  ' + fmtDate(it.e.p);
-  $('plImg').src = thumbUrl(it.e.i);
+  plImg.src = thumbUrl(it.e.i) || COVER_FALLBACK;
   updateTimes();
   updateSeekBar();
   updateMediaSession(it);
@@ -1613,7 +1621,8 @@ function syncFeedSelect() {
   sel.innerHTML = '';
   const all = document.createElement('option');
   all.value = '';
-  all.textContent = '全部订阅（' + feeds.length + '）';
+  // all.textContent = '全部订阅（' + feeds.length + '）';
+  all.textContent = '全部订阅';
   sel.appendChild(all);
   for (const f of feeds) {
     const o = document.createElement('option');
