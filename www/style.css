@@ -175,20 +175,31 @@ button { font: inherit; color: inherit; cursor: pointer; }
   .bars::before { background: var(--panel); }
 }
 
-.top {
-  display: flex;
-  align-items: center;
-  justify-content: center;   /* 左上角不再放标题，状态和按钮都靠右 */
-  gap: 10px;
-  padding: 0 var(--space-inline);
-  padding-top: var(--sync-status-height);
-  /* border-bottom: 1px solid var(--line); */
-  /* 状态文字是启动后才填进来的，空着时也占住一行（6px 上边距 + 10px * 1.45 行高），
-     否则 --top-h 会在文字出现前量小，列表第一行钻到浮层底下 */
-  /* min-height: calc(6px + 1.45 * 10px); */
+.status {
+  flex: 0 0 100%;            /* 独占工具栏的第二行，别和按钮挤在一行 */
+  /* 上下内边距永远一样大：显示时文字上下都是 4px（下面那 4px 由这里出，
+     工具栏的 padding-bottom 在显示时归零） */
+  padding: 4px 0;
+  font-size: var(--dim-font-size);
+  color: var(--dim);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* 消息停留几秒后由 app.js 的 setStatus 打上 .hide，把整行连同上下 padding 一起收起来。
+     上限只留「上下内边距 + 一行 10px 字号的行高」（body 的 line-height 是 1.45），
+     否则 max-height 从一个大值收到 0 时，前大半段时间看着不动。 */
+  max-height: calc(8px + 1.45 * var(--dim-font-size));
+  transition: max-height .3s ease, padding .3s ease, opacity .3s ease;
+  /* 动画期间高度一直在变，--top-h 由 ResizeObserver 跟着量，列表不会闪 */
 }
-.top-right { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.status { font-size: var(--dim-font-size); color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 收起态：高度归 0，上下 padding 同时归零，过程中也保持对称 */
+.status.hide {
+  max-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  opacity: 0;
+}
 
 .icon-btn {
   /* border: 1px solid var(--line); */
@@ -236,11 +247,18 @@ button { font: inherit; color: inherit; cursor: pointer; }
 /* ---------- 过滤栏 ---------- */
 .toolbar {
   display: flex;
-  gap: 10px;
+  flex-wrap: wrap;           /* 状态行换到第二行 */
+  column-gap: 10px;
+  row-gap: 0;
   padding: 9px var(--space-inline);
-  padding-top: var(--sync-status-height);
   /* border-bottom: 1px solid var(--line); */
   /* 底色交给外层 .bars，这里保持透明，两栏才是一整块玻璃 */
+  transition: padding-bottom .3s ease;
+}
+/* 状态行出现时只把下内边距归零，文字下面的空隙才和上面一样，都是 .status 的 4px。
+   上内边距始终是 9px，不动。 */
+.toolbar:has(.status:not(.hide)) {
+  padding-bottom: 0;
 }
 /* 订阅源选择：原生 select 的下拉面板各端长什么样管不了，换成按钮 + 自绘菜单。
    按钮占满原来 select 的位置，菜单外观和「筛选」「倍速」共用下面的 .menu。 */
@@ -469,7 +487,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .player::before { background: var(--panel); }
 }
-.pl-top { display: grid; grid-template-columns: 60px 1fr auto; gap: 10px; align-items: center; }
+.pl-top { display: grid; grid-template-columns: 60px 1fr auto; gap: 10px; align-items: center; cursor: pointer; }
 .pl-img { width: 60px; height: 40px; border-radius: 7px; background: var(--panel2); object-fit: cover; display: block; }
 .pl-info { min-width: 0; }
 .pl-title { font-size: var(--main-font-size); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

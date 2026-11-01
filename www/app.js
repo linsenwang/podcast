@@ -397,7 +397,26 @@ function epId(feedId, ep) { return feedId + '/' + (ep.g || ep.u); }
 function isFinished(pr) {
   return !!pr && (pr.f === 1 || (pr.d > 0 && pr.p / pr.d >= DONE_RATIO));
 }
-function setStatus(s) { $('status').textContent = s || ''; }
+// 顶栏消息只短暂停留：每来一条新消息就重新计时，5 秒后淡出并收起状态行。
+// STATUS_FADE 与 style.css 里 .status 的 transition 时长一致，收起完再清空文字。
+const STATUS_TTL = 5000;
+const STATUS_FADE = 300;
+let statusTimer = 0;
+function setStatus(s) {
+  const el = $('status');
+  clearTimeout(statusTimer);
+  if (!s) {
+    el.textContent = '';
+    el.classList.add('hide');
+    return;
+  }
+  el.classList.remove('hide');
+  el.textContent = s;
+  statusTimer = setTimeout(() => {
+    el.classList.add('hide');
+    statusTimer = setTimeout(() => { el.textContent = ''; }, STATUS_FADE);
+  }, STATUS_TTL);
+}
 
 /* ================= 解析 ================= */
 function parseFeed(xml) {
@@ -749,6 +768,20 @@ function fill() {
   }
 }
 
+// 点播放器顶部回到列表里正在播的那一集。列表是分批渲染的，目标还没铺到就
+// 继续往下铺到它出现，再把它滚到屏幕中间。
+function jumpToPlaying() {
+  if (!current) return;
+  const idx = view.findIndex((it) => it.id === current.id);
+  if (idx < 0) {
+    setStatus('正在播放的单集不在当前列表里');
+    return;
+  }
+  while (rendered <= idx && rendered < view.length) renderMore();
+  const row = $('list').querySelector('.ep.playing');
+  if (row) row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
 function toggleDone(it) {
   const wasDone = isFinished(progress[it.id]);
   const base = progress[it.id] || {};
@@ -799,9 +832,17 @@ let manualSeekAt = 0;      // 本页主动定位的时间，别把拖动误判�
 let seekNearEnd = false;   // 用户主动拖到了结尾附近，这次的"回卷"算播完
 let wrapping = false;      // 正在切下一集，防止 seeking/timeupdate 重复触发
 let needReload = false;    // 断流后元素停在截断的结尾，下次播放必须先 load()
+let playedThisPage = false; // 本页是否真的出过声（见 requestPlay 里的 iOS 26 兜底）
+let sourceFresh = false;    // src 是不是刚在同一个手势里设过，别再重设一次
+let lastAudioMoveAt = 0;    // currentTime 最近一次推进的时间
+let playWatchdog = 0;       // play() resolve 了却一直没声音时的兜底定时器
+let playAttempt = 0;        // 每次播放尝试的编号，防止旧定时器误伤新尝试
+let hiddenAt = 0;           // 切到后台的时间，回来时判断离开了多久
 
 const STALL_RETRY_MAX = 3;
 const STALL_WAIT_MS = 5000;          // 第 n 次重试等 n*5 秒
+const PLAY_ALIVE_MS = 5000;          // 前台超过这么久没推进就当作没在响
+const PLAY_WATCHDOG_MS = 4000;       // play() 之后多久还没声音就强制换源重试
 
 // 网络断流时浏览器会把"已经缓冲到哪"当成整个音频资源的结尾：duration 会变成一个
 // 明显偏小的值（也可能直接是 NaN / Infinity），播到那儿就触发 ended。
@@ -843,6 +884,76 @@ function armAudioSession() {
   } catch (_) {}
 }
 
+// play() 在旧 WebKit 上可能不返回 Promise，统一走这里，别让同步异常
+// 把后面的逻辑打断。
+function callPlay() {
+  let p;
+  try { p = audio.play(); } catch (err) { onPlayError(err); return; }
+  if (p && typeof p.catch === 'function') p.catch(onPlayError);
+}
+
+function clearPlayWatchdog() {
+  if (playWatchdog) { clearTimeout(playWatchdog); playWatchdog = 0; }
+  playAttempt++;
+}
+
+// 播放位置：源还没加载时（比如 PWA 被回收后重开、播放器只是摆回来）
+// 用 pendingSeek / 已保存的进度，别让界面显示成 0:00。
+function currentPosition() {
+  if (pendingSeek != null && audio.readyState < 2) return pendingSeek;
+  return isFinite(audio.currentTime) ? Math.max(audio.currentTime || 0, 0) : 0;
+}
+
+function savedPosition(it) {
+  const pr = it && progress[it.id];
+  return pr && !isFinished(pr) && pr.p > 0 ? pr.p : 0;
+}
+
+// 元素此刻是不是真的在响。三件事都要成立：
+//  1. 用户意图是播放；2. 元素没被暂停、没播完、没报错；
+//  3. 前台时 currentTime 最近还在推进。
+// 不能只看 wantPlay（iOS 26 的 PWA 里 play() 可能 resolve 却完全没声音），
+// 也不能只看 audio.paused（切后台/中断后可能停了却仍报 paused=false）。
+function isActuallyPlaying() {
+  if (!wantPlay || audio.ended || audio.error || audio.paused) return false;
+  if (audio.readyState < 2) return false;
+  // 后台拿不到 timeupdate，不能拿"多久没动"判死，否则回前台会把还在
+  // 正常播放的音频当成停了、重新拉流，反而把后台播放掐断。
+  if (document.hidden) return true;
+  return !lastAudioMoveAt || Date.now() - lastAudioMoveAt < PLAY_ALIVE_MS;
+}
+
+// play() 之后如果 4 秒还没有任何声音（currentTime 不动、也没进过 playing），
+// 就强制换一次源再试。iOS 26 的 PWA 在重开后会让 <audio> 卡住：
+// play() 正常 resolve、没有 error，但完全不出声（WebKit bug 295518）。
+// 这个兜底只在看得见页面时跑 —— 后台的定时器本来就会被冻住。
+function armPlayWatchdog(at, retried) {
+  clearPlayWatchdog();
+  const token = playAttempt;
+  const armedAt = Date.now();
+  playWatchdog = setTimeout(() => {
+    playWatchdog = 0;
+    if (token !== playAttempt || !wantPlay || !current) return;
+    if (document.hidden) return;                 // 回前台由 onForeground 再补
+    // 还没拿到可用数据、网络仍在加载：这多半是慢，不是卡死。别在这里
+    // 重置，否则慢网下刚拉起的请求会被一遍遍掐掉。真正的网络问题由
+    // stalled / error 事件管。
+    if (audio.readyState < 2 && audio.networkState === 2) return;
+    const moved = isFinite(at) && audio.currentTime > at + 0.2;
+    // 已经真的放过（playing 过）又被暂停，是被系统/用户停的，不是"没起来"
+    if (audio.paused && lastAudioMoveAt >= armedAt) return;
+    if (!audio.paused && isMediaAlive()
+        && (moved || lastAudioMoveAt >= armedAt)) return;
+    if (retried) {
+      wantPlay = false;
+      setStatus('播放没起来，点播放继续');
+      return;
+    }
+    const pos = audio.currentTime > 0 ? audio.currentTime : at;
+    reloadAt(pos, true);
+  }, PLAY_WATCHDOG_MS);
+}
+
 // 当前位置是不是"从结尾回卷到了开头"。用户自己拖进度条不算：
 // seekTo() 会先记 manualSeekAt，由 seeking/seeked 两个事件兜住。
 function maybeWrapped(from, to) {
@@ -855,18 +966,27 @@ function maybeWrapped(from, to) {
 // 重新走一遍资源选择，再定位回断点播放。
 // 后台被系统挂起/中断之后，元素可能停在"请求过播放但没有任何数据"甚至 error 的状态，
 // 这时光调 play() 不会重新拉流，必须 load()。
-function reloadAt(pos) {
+// 先清空 src 再设回同一个地址：iOS 26 的 PWA 重开后，元素会卡在"有 src 但不出声"
+// 的状态，直接再赋一次同样的 URL 不一定能重新走加载流程（WebKit bug 295518）。
+function reloadAt(pos, fromWatchdog) {
   if (!current) return;
+  clearPlayWatchdog();
+  cancelResume();
   pendingSeek = pos > 0 ? pos : null;
   audio.loop = true;
   needReload = false;
   lastTime = 0;
   seekNearEnd = false;
+  sourceFresh = false;
+  armAudioSession();
+  try { audio.pause(); } catch (_) {}
+  try { audio.removeAttribute('src'); audio.load(); } catch (_) {}
   audio.src = toLocal(current.e.u);
   audio.load();
   audio.playbackRate = settings.speed;
   wantPlay = true;
-  audio.play().catch(onPlayError);
+  armPlayWatchdog(pendingSeek || 0, !!fromWatchdog);
+  callPlay();
 }
 
 // 想继续播（锁屏播放键、回来点播放、从后台恢复）都走这里
@@ -876,35 +996,61 @@ function requestPlay() {
   cancelResume();                      // 用户/系统主动操作了，撤掉待执行的自动重试
   wantPlay = true;
   audio.playbackRate = settings.speed;
-  const at = audio.currentTime > 0
-    ? audio.currentTime
-    : ((progress[current.id] && progress[current.id].p) || 0);
-  // 上次加载失败、系统把 src 清掉了、或断流停在截断的结尾：直接 play() 救不回来
-  if (!audio.getAttribute('src') || audio.error || needReload) {
-    reloadAt(at);
+  const at = currentPosition() || savedPosition(current);
+  // 上次加载失败、系统把 src 清掉了、断流停在截断的结尾，或这是本页第一次播放：
+  // 直接 play() 救不回来。iOS 26 的 PWA 重开后尤其明显，必须在 play() 前
+  // 重新设一遍 src（WebKit bug 295518）。
+  const needReset = !audio.getAttribute('src') || audio.error || needReload
+    || (!playedThisPage && !sourceFresh);
+  sourceFresh = false;
+  if (needReset) {
+    reloadAt(at, false);
     return;
   }
-  audio.play().catch(onPlayError);
+  armPlayWatchdog(at, false);
+  callPlay();
 }
 
 // 用户主动暂停：清掉播放意图，回到前台时不会被自动恢复
 function userPause() {
   wantPlay = false;
+  clearPlayWatchdog();
   cancelResume();
   audio.pause();
   saveProgress(true);
 }
 
-// 从后台回到前台 / bfcache 恢复：意图是播放、元素却没了声音，就重新拉流续播。
+// 从后台回到前台 / bfcache 恢复：意图是播放、元素却没了声音，就补一下。
 // 系统在后台把 WebContent 挂起时，定时器也会一起冻住，自动重试用不上，
 // 只能等回到前台补这一下。
-function resumeIfNeeded() {
-  if (!current || !wantPlay || stallTimer) return;
-  if (!audio.paused && isMediaAlive()) return;   // 正在正常播放，别打扰
-  const at = audio.currentTime > 0
-    ? audio.currentTime
-    : ((progress[current.id] && progress[current.id].p) || 0);
-  reloadAt(at);
+function resumeIfNeeded(awayMs) {
+  if (!current || !wantPlay) return;
+  // 后台排下的重试定时器会被冻住。离开很久回来时直接接手续播，
+  // 不再干等那个已经过期的定时器；短时间离开还是让它自己跑完。
+  if (stallTimer) {
+    if (awayMs > 60000) cancelResume();
+    else return;
+  }
+  // 正在正常播放，别打扰。后台可能没有 timeupdate，所以这里不更新
+  // lastAudioMoveAt：回到前台后由真实的 timeupdate 证明它还在响。
+  // 但也挂一个 watchdog：如果元素只是"报 paused=false"却没声音，
+  // 4 秒后会自动换源；真在播的话 timeupdate 会把它清掉。
+  if (!audio.paused && isMediaAlive()) {
+    armPlayWatchdog(audio.currentTime, false);
+    return;
+  }
+  const at = currentPosition() || savedPosition(current);
+  // 元素没源 / 报错 / 断流 / 在后台待了太久：重新走一遍资源选择。
+  // 离开超过一分钟，WebKit 很可能已经把元素挂起（iOS 26 上还会卡成静音），
+  // 这时 play() 不一定能救回来。只是短时间被系统暂停的，先原地 play() ——
+  // 不要重设 src，免得把现有的 audio session 和缓冲一起丢掉。
+  if (!audio.getAttribute('src') || audio.error || needReload || awayMs > 60000) {
+    reloadAt(at, false);
+    return;
+  }
+  armAudioSession();
+  armPlayWatchdog(at, false);
+  callPlay();
 }
 
 // loop 回卷到 0：这不是用户拖动，可能是真的播完了，也可能是网络断流时
@@ -955,6 +1101,7 @@ function scheduleResume(reason) {
   if (stallRetry >= STALL_RETRY_MAX) {
     setStatus(reason + '，重试 ' + STALL_RETRY_MAX + ' 次仍未恢复，点播放可继续');
     wantPlay = false;                // 别让按钮卡在"播放中"，等用户明确点一次
+    clearPlayWatchdog();
     return;
   }
   stallRetry++;
@@ -977,6 +1124,7 @@ audio.addEventListener('loadedmetadata', () => {
     try { audio.currentTime = pendingSeek; } catch (_) {}
     pendingSeek = null;
   }
+  lastTime = audio.currentTime;
   if (current) {
     const d = displayDuration();
     if (d > 0) {
@@ -999,6 +1147,8 @@ audio.addEventListener('seeked', () => {
 });
 
 audio.addEventListener('timeupdate', () => {
+  // currentTime 在推进 = 元素真的在出声。放在最前面，别被后面的早退挡掉。
+  if (!audio.paused) lastAudioMoveAt = Date.now();
   if (!current || !audio.duration) return;
   if (maybeWrapped(lastTime, audio.currentTime)) { onTrackWrapped(); return; }
   lastTime = audio.currentTime;
@@ -1025,6 +1175,12 @@ audio.addEventListener('timeupdate', () => {
   updatePositionState();
 });
 
+// 浏览器自己认定"拿不到数据"了。先别急着重载，走原来的退避重试：
+// 5 秒后如果还没恢复，才从断点重新拉流。正常缓冲不会触发 stalled。
+audio.addEventListener('stalled', () => {
+  if (current && wantPlay && !document.hidden) scheduleResume('音频缓冲中断');
+});
+
 function updatePositionState() {
   if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState) return;
   if (!current) return;
@@ -1033,7 +1189,7 @@ function updatePositionState() {
   try {
     navigator.mediaSession.setPositionState({
       duration: d,
-      position: Math.min(Math.max(audio.currentTime || 0, 0), d),
+      position: Math.min(currentPosition(), d),
       playbackRate: audio.playbackRate,
     });
   } catch (_) {}
@@ -1064,10 +1220,7 @@ function seekTo(t) {
 
 function seekBy(delta) {
   if (!current) return;
-  const base = audio.readyState >= 1 && isFinite(audio.currentTime) && audio.currentTime > 0
-    ? audio.currentTime
-    : (pendingSeek != null ? pendingSeek : ((progress[current.id] && progress[current.id].p) || 0));
-  seekTo(base + delta);
+  seekTo(currentPosition() + delta);
 }
 
 function syncPlaybackState() {
@@ -1084,14 +1237,16 @@ audio.addEventListener('play', () => {
   startSeekTicker();
 });
 audio.addEventListener('playing', () => {
+  playedThisPage = true;           // iOS 26 的"重开后静默失败"兜底可以收工了
+  lastAudioMoveAt = Date.now();
+  clearPlayWatchdog();
   cancelResume();                  // 自己缓冲好了，不用再重试
   armAudioSession();
-  // iOS 会忽略"媒体真正开始播放之前"注册的 MediaSession handler，
-  // 所以每次进入 playing 都重新注册一遍（成本几乎为零），
-  // 锁屏的播放/暂停、±10/30 秒和 seekto 才会真的响应。
-  setupMediaSession();
+  // iOS 会忽略"媒体真正开始播放之前"注册的 MediaSession handler。
+  // 先把 metadata / playbackState 摆好，再注册 handler，顺序稳一点。
   if (current) updateMediaSession(current);
   syncPlaybackState();
+  setupMediaSession();
   const st = $('status').textContent;
   if (st.slice(0, 4) === '播放失败' || st.indexOf('重试') >= 0) setStatus('');
 });
@@ -1102,6 +1257,9 @@ audio.addEventListener('pause', () => {
   saveProgress(true);
   syncPlaybackState();
   updatePositionState();     // 暂停后锁屏面板要停在这个位置，否则滑条会回跳到旧值
+  // 暂停状态下锁屏面板还要能再点播放：iOS 可能在后台把 handler 丢掉，
+  // 这里再补注册一次，播放键才不会没反应。
+  setupMediaSession();
 });
 audio.addEventListener('ended', () => {
   stopSeekTicker();
@@ -1122,6 +1280,7 @@ audio.addEventListener('ended', () => {
     render();
   }
   wantPlay = false;          // 这一集确实播完了，别再被前台恢复逻辑拉起来
+  clearPlayWatchdog();
   const next = nextEpisode();
   if (next) play(next);
   else setStatus('列表里没有可接着播的单集了');
@@ -1136,14 +1295,14 @@ audio.addEventListener('error', () => {
 
 function updateTimes() {
   // 用 displayDuration()：媒体时长被截断/读不出来时退回 feed 声明的时长，
-  // 免得时间轴显示成 "0:12 / 0:12" 这种假的总长
-  $('plTime').textContent = fmtDur(audio.currentTime || 0) + ' / ' + fmtDur(displayDuration());
+  // 免得时间轴显示成 "0:12 / 0:12" 这种假的总长。
+  // 位置用 currentPosition()：PWA 被回收后重开、播放器只是摆回来时，
+  // 元素还没有 src，不能显示成 0:00。
+  $('plTime').textContent = fmtDur(currentPosition()) + ' / ' + fmtDur(displayDuration());
 }
 
 function updateSeekBar() {
-  const d = displayDuration();
-  const pos = isFinite(audio.currentTime) ? Math.max(audio.currentTime || 0, 0) : 0;
-  paintSeek(pos, d);
+  paintSeek(currentPosition(), displayDuration());
 }
 
 // 值没变就不碰 DOM：长音频里 1000 级刻度每帧只走一小格，没必要重绘轨道
@@ -1252,11 +1411,12 @@ function showPlayer(it) {
 
 function play(it) {
   const same = !!(current && current.id === it.id);
-  // 用意图判断而不是 audio.paused：后台/中断后元素可能 paused=false 却没声音，
-  // 按 paused 判断会把"点播放"变成"暂停"，于是怎么点都恢复不了。
-  if (same && wantPlay) { userPause(); return; }
+  // 点当前正在播的这一条不当作暂停：列表点两下很容易误触，
+  // 暂停请用播放器上的按钮。
+  if (same && wantPlay) { requestPlay(); return; }
 
   cancelResume();                          // 用户自己操作了，撤掉待执行的自动重试
+  clearPlayWatchdog();                     // 上一次尝试的兜底定时器作废
   audio.pause();                           // 换源前先 pause：iOS 只有自然 ended 才关 session
   audio.loop = true;
   needReload = false;
@@ -1264,12 +1424,16 @@ function play(it) {
   manualSeekAt = 0;
   seekNearEnd = false;
   wrapping = false;
+  // 这里设了 src 就标记一下：requestPlay() 在同一个手势里会直接 play()，
+  // 不再重复走一遍"清空 src 再重设"的冷启动兜底。
+  sourceFresh = false;
   if (same) {
     // 同一个单集接着播，不重载、不跳位置（恢复出来的断点还在 pendingSeek 里）。
     // 元素被系统清过 src / 停在错误状态时，先把源接回去。
     if (!audio.getAttribute('src') || audio.error) {
       audio.src = toLocal(it.e.u);
       audio.load();
+      sourceFresh = true;
     }
   } else {
     stallRetry = 0;                        // 换集：重试计数从头算
@@ -1278,6 +1442,7 @@ function play(it) {
     pendingSeek = pr && !isFinished(pr) && pr.p > 5 ? pr.p : 0; // 断点续播
     audio.src = toLocal(it.e.u);
     audio.load();
+    sourceFresh = true;
   }
   current = it;
   audio.playbackRate = settings.speed;
@@ -1291,6 +1456,7 @@ function play(it) {
 // 报了反而像出错。真正的失败（格式不支持、源 404）才提示。
 function onPlayError(err) {
   if (err && err.name === 'AbortError') return;
+  clearPlayWatchdog();
   // 没真正开始播，就把意图清掉，否则按钮会卡在"暂停"、下一次点击又被当成暂停
   wantPlay = false;
   // 已经排了重试就别覆盖 —— error 事件给出的提示（还能重试几次）比这句有用
@@ -1515,24 +1681,36 @@ function applyTheme() {
 $('refresh').addEventListener('click', () => refresh(true));
 
 $('plPlay').addEventListener('click', () => {
-  if (wantPlay) userPause();
+  // 用"是否真的在响"而不是 wantPlay：iOS 上元素可能 play() 过却静音停住，
+  // 这时点按钮应该重新拉起来，而不是再执行一次暂停。
+  if (isActuallyPlaying()) userPause();
   else requestPlay();
 });
 $('plBack').addEventListener('click', () => seekBy(-BACK_SEC));
 $('plFwd').addEventListener('click', () => seekBy(FWD_SEC));
 $('plClose').addEventListener('click', () => {
   wantPlay = false;
+  clearPlayWatchdog();
   cancelResume();
   closeSpeedMenu();
   closeSpeedEdit();
   saveProgress(true);
   audio.pause();
+  pendingSeek = null;
+  playedThisPage = false;          // 下次再播还是按冷启动处理
+  sourceFresh = false;
   try { audio.removeAttribute('src'); audio.load(); } catch (_) {}
   writeLS(LS_CURRENT, null);       // 主动关掉播放器：下次启动不用再摆回来
   current = null;
   $('player').hidden = true;
   syncPlayerInset();
   render();
+});
+
+// 点播放器顶部（封面/标题）回到列表里正在播的那一集；关闭按钮有自己的行为
+document.querySelector('.pl-top').addEventListener('click', (ev) => {
+  if (ev.target.closest('button')) return;
+  jumpToPlaying();
 });
 
 const seek = $('plSeek');
@@ -1600,24 +1778,33 @@ $('doneBtn').addEventListener('click', () => {
 // 掐掉或中断过），再顺手拉一次别的设备的新数据。
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
+    hiddenAt = Date.now();
     saveProgress(true);
     updatePositionState();
   } else {
-    onForeground();
+    const away = hiddenAt ? Date.now() - hiddenAt : 0;
+    hiddenAt = 0;
+    onForeground(away);
     if (Date.now() - lastPull > PULL_EVERY) syncPull();
   }
 });
 // iOS 的 PWA 从后台回来不一定触发 visibilitychange（页面可能整个被还原/进 bfcache），
 // 这两条一起兜住。系统也可能在后台丢掉 MediaSession 的 handler，一并补注册。
-function onForeground() {
+function onForeground(awayMs) {
+  if (wantPlay) armAudioSession();
+  if (current) updateMediaSession(current);  // 后台可能把锁屏信息也丢了
+  syncPlaybackState();
   setupMediaSession();
-  armAudioSession();
-  resumeIfNeeded();
+  resumeIfNeeded(awayMs);
   // 从后台回来时状态栏安全区可能变过（通话、热点），顺手重量一下
   syncBarsInset();
 }
-window.addEventListener('pageshow', onForeground);
-window.addEventListener('focus', onForeground);
+window.addEventListener('pageshow', (ev) => {
+  // bfcache 恢复出来的页面，媒体元素状态和冷启动一样不可信，按第一次播放处理
+  if (ev.persisted) { playedThisPage = false; hiddenAt = 0; }
+  onForeground(0);
+});
+window.addEventListener('focus', () => onForeground(0));
 window.addEventListener('pagehide', () => saveProgress(true));
 
 setupMediaSession();
@@ -1693,10 +1880,13 @@ function restorePlayer() {
   current = hit;
   const pr = progress[hit.id];
   pendingSeek = pr && !isFinished(pr) && pr.p > 0 ? pr.p : null;
-  audio.src = toLocal(hit.e.u);
-  audio.load();
-  audio.playbackRate = settings.speed;
+  // 这里不要设置 src / load()。iOS 26 的 PWA 重开后，先给 <audio> 装源、
+  // 之后再 play() 会卡成"play() resolve 但完全没声音"（WebKit bug 295518）；
+  // 音源留到用户点播放、在同一个手势里再设（见 requestPlay / play）。
+  // 界面上的进度用 pendingSeek 显示，不需要元数据也能摆对。
   wantPlay = false;
+  playedThisPage = false;
+  sourceFresh = false;
   showPlayer(hit);
 }
 

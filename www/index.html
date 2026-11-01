@@ -48,12 +48,6 @@
 <!-- 顶栏和工具栏合成一个 fixed 浮层（.bars）：列表从它们底下滚过，
      毛玻璃才看得到内容。高度由 app.js 量成 --top-h 让列表避开。 -->
 <div id="bars" class="bars">
-  <header class="top">
-    <div class="top-right">
-      <span id="status" class="status"></span>
-    </div>
-  </header>
-
   <div class="toolbar">
     <button id="theme" class="icon-btn" title="主题"><span id="themeIco" class="ico ico-auto"></span></button>
     <!-- 订阅源：原生 select 的下拉面板没法改样式，这里按钮 + 自绘菜单，
@@ -75,6 +69,9 @@
       </div>
     </div>
     <button id="refresh" class="icon-btn" title="刷新全部订阅" aria-label="刷新"><span class="ico ico-refresh"></span></button>
+
+    <!-- 状态行是工具栏的第二行：出现时工具栏上下的留白会收小一点，收起后恢复 -->
+    <span id="status" class="status hide"></span>
   </div>
 </div>
 
