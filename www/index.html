@@ -12,11 +12,14 @@
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<!-- 状态栏颜色用 iOS 15+ 支持的 theme-color 控制（见下面那几个 meta），
-     不要用 black-translucent：那会让 WebView 铺到状态栏底下，顶栏还要再加
-     env(safe-area-inset-top) 的 padding，实际机型上会出现状态栏和按钮之间
-     空出一大截的问题。default 让系统把页面排在状态栏下面，布局最稳。 -->
-<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<!-- 状态栏：iOS 只有 default / black / black-translucent 三档，没有"半透明"
+     这个值。black-translucent 会把页面铺到状态栏底下，那一块交给 .bars 的
+     毛玻璃接管（见 style.css 中 .bars 的 padding-top: env(safe-area-inset-top)），
+     状态栏图标下面的内容就是列表滚过顶栏时被模糊的样子。
+     代价：iOS 26 起系统还会在状态栏一带叠一层自己的 Liquid Glass 模糊，关不掉；
+     状态栏图标颜色跟系统浅/深色走，不跟 App 自己的主题走（手动切反主题时可能
+     对比度变差）。要退回不透明状态栏，把这里改回 default 即可。 -->
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="播客">
 <script>
 // 先定主题再加载样式表，避免浅色模式下先闪一下深色。
@@ -28,6 +31,14 @@
     if (t === 'auto') t = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
     document.documentElement.dataset.theme = t;
   } catch (e) { /* 读不到就按深色画，app.js 起来后会纠正 */ }
+  // 独立模式标记必须赶在样式表/首帧之前打上：底部安全区那条要用的画布色挂在
+  // 这个类下面，等 app.js 再改画布颜色时 iOS 可能不重绘那一块，会一直留着旧色。
+  try {
+    if (navigator.standalone === true ||
+        (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)) {
+      document.documentElement.classList.add('standalone');
+    }
+  } catch (e) { /* 不支持就按普通网页处理 */ }
 })();
 </script>
 <link rel="stylesheet" href="style.css">

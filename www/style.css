@@ -4,47 +4,49 @@
  * 所以 CSS 这边不用写媒体查询。
  */
 :root {
-  --bg: #0f1115;
-  --panel: #171a21;
-  --panel2: #1e222b;
-  --line: #272c37;
-  --fg: #e7eaf0;
-  --dim: #949cad;
+  --bg: #111111;
+  --panel: #1b1b1b;
+  --panel2: #2c2c2c66;
+  --line: #2c2c2c;
+  --fg: #eaeaea;
+  --dim: #9c9c9c;
   --accent: #4f8cff;
   --accent-dim: #2f5ea8;
-  --pressed: #2b3140;      /* 按钮按下时 */
-  --track: #2b3140;        /* 进度条槽 */
-  --playing: #16233c;      /* 正在播的那行 */
-  --sel: #1b2740;          /* 选中态底色（chip、勾、倍速） */
-  --done-off: #3f4657;     /* 未标完播的勾 */
+  --pressed: #313131;      /* 按钮按下时 */
+  --track: #313131;        /* 进度条槽 */
+  --playing: #222222;      /* 正在播的那行 */
+  --sel: #2b2b2b;          /* 选中态底色（chip、勾、倍速） */
+  --done-off: #464646;     /* 未标完播的勾 */
   --on-accent: #fff;       /* 蓝底上的图标 */
   --accent-active: #3d78e8;
-  --space-inline: 12px;
+  --space-inline: 10px;
   --btn-height: 36px;
   --main-font-size: 15px;
   --dim-font-size: 10px;
-  --panel-glass: rgba(23, 26, 33, .72);  /* 毛玻璃底色，@supports 不支持时退回 --panel */
-  --player-h: 0px;                       /* 播放器实际高度，由 app.js 量出来写进来 */
-  --top-h: 0px;                          /* 顶栏浮层高度，同上 */
+  --panel-glass: rgba(27, 27, 27, .72);  /* 毛玻璃底色，@supports 不支持时退回 --panel */
+  --top-h: 0px;                          /* 顶栏浮层高度，由 app.js 量出来写进来 */
+  --player-h: 0px;                       /* 播放器实际高度，同上 */
+  --btn-border: none;
+  --sync-status-height: 2px;
 }
 
 :root[data-theme="light"] {
-  --bg: #f4f5f7;
-  --panel: #fff;
-  --panel2: #edeff3;
-  --line: #dcdfe6;
-  --fg: #101318;
-  --dim: #6a7280;
+  --bg: #fff;
+  --panel: #f5f5f5;
+  --panel2: #dfdfdf66;
+  --line: #dfdfdf;
+  --fg: #131313;
+  --dim: #717171;
   --accent: #2f6fe4;
   --accent-dim: #a3c0f3;
-  --pressed: #e2e6ee;
-  --track: #e0e4ea;
-  --playing: #e3ecff;
-  --sel: #e3ecff;
-  --done-off: #c3c9d4;
+  --pressed: #e6e6e6;
+  --track: #e4e4e4;
+  --playing: var(--panel2);
+  --sel: #ececec;
+  --done-off: #c9c9c9;
   --on-accent: #fff;
   --accent-active: #2a62cf;
-  --panel-glass: rgba(255, 255, 255, .72);
+  --panel-glass: rgba(250, 250, 250, .72);
 }
 
 * { box-sizing: border-box; }
@@ -59,9 +61,16 @@ html, body {
 
 /* html 也要自己带底色。iOS 独立模式（PWA）下 100vh/100dvh 不一定等于真实可用
    高度，文档盖不到的那截会由 WKWebView 用它自己的白底补上 —— 视觉上就是屏幕最
-   底下一条全宽白条。底色写到 html 上是这类问题最省事的兜底。 */
+   底下一条全宽白条。底色写到 html 上是这类问题最省事的兜底。
+   独立模式下换成和播放器玻璃同一合成色：播放器万一没铺到的最后一截由画布来画，
+   颜色对上之后就是一根通到底的栏，而不是一条空白。
+   这个类由 index.html 的 head 内联脚本在首帧前打上，别改成运行时再加 —— iOS 上
+   改画布颜色不一定会重绘那块区域，会一直卡着旧色。 */
 html {
   background-color: var(--bg);
+}
+:root.standalone {
+  background-color: color-mix(in srgb, var(--panel) 72%, var(--bg));
 }
 
 /* 上面那个高度差的正主：-webkit-fill-available 拿到的是 WebView 真实可用高度。
@@ -77,6 +86,7 @@ html {
 }
 
 body {
+  position: relative;   /* 播放器 absolute 定位的参照物 */
   height: 100vh;
   height: 100dvh;
   display: flex;
@@ -87,6 +97,19 @@ body {
         "Hiragino Sans GB", "Microsoft YaHei", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
   overscroll-behavior-y: none;
+}
+
+/* iOS 26.0 的 100dvh 会比真实屏幕矮一截（26.1 修过，后来又回归过），独立模式下
+   改用大视口高度，让 body 一直铺到屏幕底 —— 播放器绝对定位在 body 底，高度够不
+   够直接决定 home indicator 那条会不会露出来。Safari 标签页里 lvh 会把收起的
+   地址栏也算进去，所以只在独立模式生效。 */
+html.standalone {
+  height: 100vh;
+  height: 100lvh;
+}
+html.standalone body {
+  height: 100vh;
+  height: 100lvh;
 }
 
 button { font: inherit; color: inherit; cursor: pointer; }
@@ -100,6 +123,9 @@ button { font: inherit; color: inherit; cursor: pointer; }
   left: 0;
   right: 0;
   z-index: 30;
+  /* black-translucent 下页面铺到状态栏底下，这块区域由这层毛玻璃自己补出来：
+     状态栏图标压在玻璃上，按钮和状态文字留在安全区内。非 iOS（inset 为 0）无影响。 */
+  padding-top: env(safe-area-inset-top);
   background: var(--panel-glass);
   -webkit-backdrop-filter: blur(14px) saturate(1.2);
   backdrop-filter: blur(14px) saturate(1.2);
@@ -114,19 +140,19 @@ button { font: inherit; color: inherit; cursor: pointer; }
   align-items: center;
   justify-content: center;   /* 左上角不再放标题，状态和按钮都靠右 */
   gap: 10px;
-  /* padding: calc(10px + env(safe-area-inset-top)) var(--space-inline) 0; */
   padding: 0 var(--space-inline);
-  padding-top: 6px;
+  padding-top: var(--sync-status-height);
   /* border-bottom: 1px solid var(--line); */
   /* 状态文字是启动后才填进来的，空着时也占住一行（6px 上边距 + 10px * 1.45 行高），
      否则 --top-h 会在文字出现前量小，列表第一行钻到浮层底下 */
-  min-height: calc(6px + 1.45 * 10px);
+  /* min-height: calc(6px + 1.45 * 10px); */
 }
 .top-right { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .status { font-size: var(--dim-font-size); color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .icon-btn {
-  border: 1px solid var(--line);
+  /* border: 1px solid var(--line); */
+  border: var(--btn-border);
   background: var(--panel2);
   border-radius: 9px;
   padding: 6px;
@@ -171,7 +197,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
   display: flex;
   gap: 10px;
   padding: 9px var(--space-inline);
-  padding-top: 6px;
+  padding-top: var(--sync-status-height);
   /* border-bottom: 1px solid var(--line); */
   /* 底色交给外层 .bars，这里保持透明，两栏才是一整块玻璃 */
 }
@@ -180,7 +206,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
   min-width: 0;
   background: var(--panel2);
   color: var(--fg);
-  border: 1px solid var(--line);
+  /* border: 1px solid var(--line); */
+  border: var(--btn-border);
   border-radius: 9px;
   padding: 6px 8px;
   font: inherit;
@@ -232,13 +259,21 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .chip.on { border-color: var(--accent); color: var(--fg); background: var(--sel); }
 
 /* ---------- 单集列表 ---------- */
-/* 上下两条浮层（.bars / .player）都浮在列表上：列表内容从底下滚过，毛玻璃
-   才有东西可模糊。留出两条浮层的高度（--top-h / --player-h 由 app.js 量）以免遮挡内容。 */
+/* 上下两条浮层都压在列表上：顶栏 fixed，播放器 absolute 贴在 body（= 屏幕）底部。
+   列表内容从它们底下滚过，毛玻璃才有东西可模糊。留出两条浮层的高度以免遮挡内容。 */
 .list {
   flex: 1 1 auto;
   overflow-y: auto;
-  -webkit-overflow-scrolling: touch;
+  /* 别加 -webkit-overflow-scrolling: touch。它会把列表提成独立的合成滚动层，
+     iOS 上这一层会留旧绘制结果：播放器/画布换了颜色，要等下一次整页重绘
+     （拖顶栏、播放器）才生效，表现就是底部一条空白死活不消失。
+     iOS 13 起惯性滚动本来就是默认行为，这行早就没用了。 */
+  /* --top-h 只含顶栏自身高度，状态栏安全区单独加：env() 由布局引擎算，
+     不会受启动时 JS 量早了的连带影响（black-translucent 下 .bars 的
+     padding-top 就是同一截高度） */
   padding-top: calc(var(--top-h));
+  padding-top: calc(var(--top-h) + env(safe-area-inset-top, 0px));
+  /* 播放器绝对定位压在列表上，最后一条要能滚到它上面 */
   padding-bottom: var(--player-h);
 }
 
@@ -306,18 +341,23 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .empty { padding: 40px 20px; text-align: center; color: var(--dim); font-size: 13.5px; }
 
 /* ---------- 播放器 ---------- */
+/* 用 absolute 贴在 body 底，而不是 position: fixed。iOS 26 上 fixed 的底栏会被钉
+   在布局视口底（比真实屏幕高一截，home indicator 那条露出来），WebKit 312149 还
+   报告过它偶发被画到错误高度、要等下一次手势才归位。body 在独立模式下铺到屏幕
+   底，absolute 的 bottom: 0 就能一直填到物理屏幕边缘；列表仍然从它底下滚过，
+   毛玻璃才有的可模糊。 */
 .player {
-  position: fixed;
+  position: absolute;
   left: 0;
   right: 0;
   bottom: 0;
   z-index: 20;
-  border-top: 1px solid var(--line);
+  /* border-top: 1px solid var(--line); */
   padding: 10px var(--space-inline) calc(10px + env(safe-area-inset-bottom));
   background: var(--panel-glass);
   -webkit-backdrop-filter: blur(14px) saturate(1.2);
   backdrop-filter: blur(14px) saturate(1.2);
-  /* iOS 上不单独提成合成层时，列表滚动过程中模糊层不会跟着重绘，会一直糊着旧内容 */
+  /* iOS 上不单独提成合成层时，模糊层不会跟着重绘，会一直糊着旧内容 */
   transform: translateZ(0);
 }
 /* 老浏览器/关掉模糊的设备：直接给不透明底色，别让文字压在列表上 */
@@ -358,7 +398,9 @@ button { font: inherit; color: inherit; cursor: pointer; }
   border: 0;
   border-radius: 50%;
   background: var(--on-accent);
-  box-shadow: 0 1px 4px rgba(0, 0, 0, .45);
+  /* box-shadow: 0 1px 4px rgba(0, 0, 0, .45); */
+  box-shadow: none;
+  display: none;
 }
 .pl-seek:active::-webkit-slider-thumb { transform: scale(1.15); }
 
@@ -395,7 +437,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .play-btn:active { background: var(--accent-active); }
 
 .speed-btn {
-  border: 1px solid var(--line);
+  /* border: 1px solid var(--line); */
+  border: var(--btn-border);
   background: var(--panel2);
   border-radius: 9px;
   padding: 6px 9px;

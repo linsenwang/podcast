@@ -1209,7 +1209,7 @@ function setupMediaSession() {
   });
 }
 
-// 播放器是 fixed 浮在列表上方（见 style.css 的 .player），列表底部要留出它的高度，
+// 播放器用 absolute 压在列表上（见 style.css 的 .player），列表底部要留出它的高度，
 // 否则最后一条会被盖住。倍速编辑面板展开/收起会改高度，用 ResizeObserver 跟着量。
 function syncPlayerInset() {
   const p = $('player');
@@ -1217,10 +1217,14 @@ function syncPlayerInset() {
 }
 if (window.ResizeObserver) new ResizeObserver(syncPlayerInset).observe($('player'));
 
-// 顶栏 + 工具栏合并成的 .bars 也是 fixed 浮层，列表顶部同样要让出它的高度
+// 顶栏 + 工具栏合并成的 .bars 还是 fixed 浮层，列表顶部同样要让出它的高度。
+// 这里只量顶栏自身的高度：状态栏安全区那截由 .list 用 env() 自己补（见 style.css），
+// 因为 iOS 启动瞬间 env(safe-area-inset-top) 可能还没生效，跟着一起量会少一截，
+// 第一行就会钻到顶栏底下。
 function syncBarsInset() {
   const b = $('bars');
-  document.documentElement.style.setProperty('--top-h', (b ? b.offsetHeight : 0) + 'px');
+  const pad = b ? parseFloat(getComputedStyle(b).paddingTop) || 0 : 0;
+  document.documentElement.style.setProperty('--top-h', (b ? b.offsetHeight - pad : 0) + 'px');
 }
 if (window.ResizeObserver) new ResizeObserver(syncBarsInset).observe($('bars'));
 syncBarsInset();   // 首次量一遍，别等 ResizeObserver 的异步回调
@@ -1589,6 +1593,8 @@ function onForeground() {
   setupMediaSession();
   armAudioSession();
   resumeIfNeeded();
+  // 从后台回来时状态栏安全区可能变过（通话、热点），顺手重量一下
+  syncBarsInset();
 }
 window.addEventListener('pageshow', onForeground);
 window.addEventListener('focus', onForeground);
