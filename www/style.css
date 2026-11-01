@@ -140,6 +140,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
 }
 .icon-btn:active { background: var(--pressed); }
 .icon-btn[disabled] { opacity: .45; cursor: default; }
+/* 图标按钮也能表达"当前有非默认设置"（筛选按钮用） */
+.icon-btn.on { border-color: var(--accent); background: var(--sel); }
 
 /* 图标统一用 CSS mask，颜色跟着 currentColor 走，SVG 本身只提供形状 */
 .ico {
@@ -158,6 +160,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .ico-replay { --ico: url(icons/replay_10.svg); }
 .ico-forward { --ico: url(icons/forward_30.svg); }
 .ico-add { width: 16px; height: 16px; --ico: url(icons/add.svg); }
+.ico-filter { --ico: url(icons/filter_list.svg); }
 /* 主题按钮按当前模式换图标：auto=自动、light=太阳、dark=月亮 */
 .ico-auto { --ico: url(icons/brightness_auto.svg); }
 .ico-light { --ico: url(icons/light_mode.svg); }
@@ -187,7 +190,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 /* 视图筛选下拉：和原来一样三个按钮，只是收起来，点「筛选」才展开。
    外观照倍速菜单来：外层小圆角 + 内部条目方一点，别再是胶囊套圆角盒子。 */
 .filter-wrap { position: relative; flex: 0 0 auto; display: flex; align-items: center; }
-.filter-btn { flex: 0 0 auto; height: var(--btn-height);}
+.filter-btn { flex: 0 0 auto; }
 .filter-menu {
   position: absolute;
   right: 0;
