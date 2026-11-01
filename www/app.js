@@ -463,18 +463,25 @@ async function loadIndex() {
   const ttsFeed = new URL('tts/feed.xml', document.baseURI).href;
   list.push({ id: 'tts', title: '本地 TTS', xmlUrl: ttsFeed, url: ttsFeed });
 
-  // 外部 Fireside 源：源站不带 CORS 头，跨源 fetch 会被浏览器拦掉，
-  // 统一走 podcast 的 nginx 同源反代（见 nginx.conf 的 /<id>/rss）。
-  // 单集音频是 https 直链，<audio> 跨源播放不需要 CORS。
-  const external = [
-    ['latepost', '晚点聊 LateTalk'],
-    ['fuyoutiandi', '蜉蝣天地 Meanders'],
-    ['shanyouhu', '山有虎'],
-  ];
-  for (const [id, title] of external) {
-    const u = new URL(id + '/rss', document.baseURI).href;
-    list.push({ id, title, xmlUrl: u, url: u });
-  }
+  // 外部订阅：列表只在 external-feeds.tsv 里维护，nginx 启动时按它生成反代
+  // （见 gen-external-feeds.sh），客户端也读同一份文件。源站不带 CORS 头，
+  // 所以 feed 走同源反代 /ext/<id>/rss；单集音频是 https 直链，播放不需要 CORS。
+  // 文件拿不到时只是少几个外部源，不能影响 podsync 的订阅。
+  try {
+    const res = await fetch(new URL('external-feeds.tsv', document.baseURI), { cache: 'no-store' });
+    if (res.ok) {
+      for (const raw of (await res.text()).split('\n')) {
+        const line = raw.replace(/\r$/, '');
+        if (!line.trim() || line.trim().startsWith('#')) continue;
+        const cols = line.split('\t');
+        const id = (cols[0] || '').trim();
+        if (!/^[a-z0-9_-]+$/.test(id)) continue;
+        const title = (cols[1] || id).trim();
+        const u = new URL('ext/' + id + '/rss', document.baseURI).href;
+        list.push({ id: id, title: title, xmlUrl: u, url: u });
+      }
+    }
+  } catch (_) { /* 外部列表不可用不影响主流程 */ }
   return list;
 }
 

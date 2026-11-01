@@ -1,0 +1,17 @@
+# 外部播客订阅：一处配置，nginx 反代和 App 订阅列表都从这里生成。
+#
+# 每行三列，用 TAB 分隔：id <TAB> 显示名 <TAB> 上游 RSS 地址
+#   id     只允许小写字母/数字/下划线/连字符，决定反代路径 /ext/<id>/rss
+#   地址   必须是最终地址。nginx 不跟随 302，拿不准就先在浏览器里看跳转后的 URL。
+#
+# 加完重启 podcast 容器生效（重启会重新生成反代）：
+#   docker compose up -d --force-recreate podcast
+#
+# 新源的单集封面如果不在缩略图白名单里（hdslb.com / ytimg.com / ggpht.com /
+# fireside.fm / xyzcdn.net），还要在 podcast/thumbs/app.py 的 ALLOWED_DOMAINS 里加域名。
+
+latepost	晚点聊 LateTalk	https://feeds.fireside.fm/latetalk/rss
+fuyoutiandi	蜉蝣天地 Meanders	https://feeds.fireside.fm/fuyoutiandi/rss
+shanyouhu	山有虎	https://feeds.fireside.fm/shanyouhu/rss
+sv101	硅谷101（播客）	https://feeds.fireside.fm/sv101/rss
+xyzfm	张小珺Jùn｜商业访谈录	https://feed.xyzfm.space/dk4yh3pkpjp3
