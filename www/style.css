@@ -378,7 +378,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .pl-seek:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 4px var(--sel); }
 
 .pl-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.pl-time { font-size: var(--main-font-size); color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pl-time { font-size: var(--dim-font-size); color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .pl-btns { display: flex; align-items: center; gap: 8px; }
 
 .play-btn {
