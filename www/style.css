@@ -28,6 +28,17 @@
   --player-h: 0px;                       /* 播放器实际高度，同上 */
   --btn-border: none;
   --sync-status-height: 2px;
+  /* 下拉菜单（订阅源 / 筛选 / 倍速）共用的一套外观参数 */
+  --menu-bg: var(--panel2);
+  --menu-line: var(--line);
+  --menu-radius: 10px;
+  --menu-pad: 5px;
+  --menu-gap: 2px;
+  --menu-shadow: 0 8px 26px rgba(0, 0, 0, .35);
+  --menu-blur: 4px;
+  --menu-item-radius: 7px;
+  --menu-item-pad: 8px 12px;
+  --menu-item-font-size: var(--main-font-size);
 }
 
 :root[data-theme="light"] {
@@ -40,13 +51,14 @@
   --accent: #2f6fe4;
   --accent-dim: #a3c0f3;
   --pressed: #e6e6e6;
-  --track: #e4e4e4;
+  --track: #c9c9c966;
   --playing: var(--panel2);
   --sel: #ececec;
   --done-off: #c9c9c9;
   --on-accent: #fff;
   --accent-active: #2a62cf;
   --panel-glass: rgba(250, 250, 250, .72);
+  --menu-shadow: 0 8px 26px rgba(20, 30, 60, .18);
 }
 
 * { box-sizing: border-box; }
@@ -126,13 +138,26 @@ button { font: inherit; color: inherit; cursor: pointer; }
   /* black-translucent 下页面铺到状态栏底下，这块区域由这层毛玻璃自己补出来：
      状态栏图标压在玻璃上，按钮和状态文字留在安全区内。非 iOS（inset 为 0）无影响。 */
   padding-top: env(safe-area-inset-top);
+}
+/* 毛玻璃画在 ::before 上，不画在 .bars 自己身上。带 backdrop-filter 的元素会成为
+   后代的 backdrop root：菜单（.filter-menu）再写 backdrop-filter 时只能采样
+   .bars 内部那块纯色背景，等于没效果。挪到伪元素后，菜单的 backdrop root 回到
+   文档根，压在列表上的那截才真的会糊。
+   transform 一起挪下来：iOS 上要提成合成层才会跟着滚动重绘；而带 transform 的
+   祖先在部分 WebKit 版本里同样会截断后代的 backdrop-filter。 */
+.bars::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
   background: var(--panel-glass);
   -webkit-backdrop-filter: blur(14px) saturate(1.2);
   backdrop-filter: blur(14px) saturate(1.2);
-  transform: translateZ(0);   /* iOS 滚动时模糊实时重绘，理由同 .player */
+  transform: translateZ(0);
+  pointer-events: none;
 }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-  .bars { background: var(--panel); }
+  .bars::before { background: var(--panel); }
 }
 
 .top {
@@ -187,6 +212,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .ico-forward { --ico: url(icons/forward_30.svg); }
 .ico-add { width: 16px; height: 16px; --ico: url(icons/add.svg); }
 .ico-filter { --ico: url(icons/filter_list.svg); }
+.ico-expand { --ico: url(icons/arrow_drop_down.svg); }
 /* 主题按钮按当前模式换图标：auto=自动、light=太阳、dark=月亮 */
 .ico-auto { --ico: url(icons/brightness_auto.svg); }
 .ico-light { --ico: url(icons/light_mode.svg); }
@@ -201,51 +227,106 @@ button { font: inherit; color: inherit; cursor: pointer; }
   /* border-bottom: 1px solid var(--line); */
   /* 底色交给外层 .bars，这里保持透明，两栏才是一整块玻璃 */
 }
-.toolbar select {
+/* 订阅源选择：原生 select 的下拉面板各端长什么样管不了，换成按钮 + 自绘菜单。
+   按钮占满原来 select 的位置，菜单外观和「筛选」「倍速」共用下面的 .menu。 */
+.feed-wrap { position: relative; flex: 1 1 auto; min-width: 0; display: flex; }
+.feed-btn {
   flex: 1 1 auto;
   min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: var(--btn-height);
+  padding: 6px 8px;
   background: var(--panel2);
   color: var(--fg);
-  /* border: 1px solid var(--line); */
   border: var(--btn-border);
   border-radius: 9px;
-  padding: 6px 8px;
   font: inherit;
-  font-size: 13px;
-  height: var(--btn-height);
+  font-size: var(--main-font-size);
+  text-align: left;
 }
-/* 视图筛选下拉：和原来一样三个按钮，只是收起来，点「筛选」才展开。
-   外观照倍速菜单来：外层小圆角 + 内部条目方一点，别再是胶囊套圆角盒子。 */
-.filter-wrap { position: relative; flex: 0 0 auto; display: flex; align-items: center; }
-.filter-btn { flex: 0 0 auto; }
-.filter-menu {
+.feed-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.feed-btn .ico-expand { width: 18px; height: 18px; flex: 0 0 auto; color: var(--dim); transition: transform .12s; }
+.feed-btn[aria-expanded="true"] .ico-expand { transform: rotate(180deg); }
+
+/* 下拉菜单通用外壳和条目：订阅源 / 筛选 / 倍速三处共用同一套变量。
+   毛玻璃放在菜单自己身上 —— 祖先 .bars/.player 的模糊已经挪到 ::before，
+   这里才采得到底下列表的内容（见 .bars::before 的说明）。 */
+.menu {
   position: absolute;
-  right: 0;
-  top: calc(100% + 6px);
   z-index: 40;
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  min-width: 132px;
-  padding: 5px;
-  background: var(--panel2);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  box-shadow: 0 8px 26px rgba(0, 0, 0, .35);
+  gap: var(--menu-gap);
+  padding: var(--menu-pad);
+  background: var(--menu-bg);
+  border: 1px solid var(--menu-line);
+  border-radius: var(--menu-radius);
+  box-shadow: var(--menu-shadow);
+  -webkit-backdrop-filter: blur(var(--menu-blur));
+  backdrop-filter: blur(var(--menu-blur));
+  /* 进出场：display 跟着一起过渡（allow-discrete），否则 hidden 一挂上就直接消失。
+     开合的目标态在下面，起始态交给 @starting-style。 */
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  transition-property: opacity, transform, display;
+  transition-duration: .15s;
+  transition-timing-function: ease;
+  transition-behavior: allow-discrete;
+  --menu-shift: -4px;             /* 向下展开的菜单从上方一点落下来 */
+  transform-origin: top right;
 }
-:root[data-theme="light"] .filter-menu { box-shadow: 0 8px 26px rgba(20, 30, 60, .18); }
-.filter-menu[hidden] { display: none; }
-.filter-menu .chip {
+/* 有 display:flex 的浮层必须显式处理 hidden，否则 [hidden] 会被作者样式盖掉 */
+.menu[hidden] {
+  display: none;
+  opacity: 0;
+  transform: translateY(var(--menu-shift, -4px)) scale(.97);
+}
+@starting-style {
+  .menu:not([hidden]) {
+    opacity: 0;
+    transform: translateY(var(--menu-shift, -4px)) scale(.97);
+  }
+}
+.menu-item {
+  /* 菜单是 flex 列：条目被 max-height 压到时不能跟着缩，否则高度不够、字被裁掉 */
+  flex: 0 0 auto;
   border: 0;
   background: transparent;
-  border-radius: 7px;
-  padding: 8px 12px;
-  font-size: 13px;
+  border-radius: var(--menu-item-radius);
+  padding: var(--menu-item-pad);
+  font-size: var(--menu-item-font-size);
   text-align: left;
-  color: var(--dim);
+  color: var(--fg);
+  white-space: nowrap;
 }
-.filter-menu .chip:active { background: var(--pressed); }
-.filter-menu .chip.on { color: var(--fg); background: var(--sel); }
+.menu-item:active { background: var(--pressed); }
+.menu-item.on { background: var(--sel); }
+/* 没有 backdrop-filter 的设备退回不透明底，别让菜单里的字和底下的列表叠在一起 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .menu { background: var(--panel); }
+}
+
+/* 订阅源菜单：宽度跟按钮走，订阅多了在菜单内部滚动 */
+.feed-menu {
+  left: 0;
+  right: 0;
+  top: calc(100% + 6px);
+  max-height: min(50vh, 320px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  transform-origin: top center;
+}
+.feed-menu .menu-item { color: var(--dim); overflow: hidden; text-overflow: ellipsis; }
+.feed-menu .menu-item.on { color: var(--fg); }
+
+/* 视图筛选下拉：和原来一样三个按钮，只是收起来，点「筛选」才展开 */
+.filter-wrap { position: relative; flex: 0 0 auto; display: flex; align-items: center; }
+.filter-btn { flex: 0 0 auto; }
+.filter-menu { right: 0; top: calc(100% + 6px); min-width: 132px; }
+.filter-menu .menu-item { color: var(--dim); }
+.filter-menu .menu-item.on { color: var(--fg); }
 .chip {
   flex: 0 0 auto;
   white-space: nowrap;
@@ -354,15 +435,24 @@ button { font: inherit; color: inherit; cursor: pointer; }
   z-index: 20;
   /* border-top: 1px solid var(--line); */
   padding: 10px var(--space-inline) calc(10px + env(safe-area-inset-bottom));
+}
+/* 毛玻璃和合成的理由同 .bars::before：播放器上还挂着倍速菜单，模糊留在 .player
+   身上会把菜单的 backdrop root 截断在这一层里，倍速菜单的 backdrop-filter 就
+   没有可采样的内容了。 */
+.player::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
   background: var(--panel-glass);
   -webkit-backdrop-filter: blur(14px) saturate(1.2);
   backdrop-filter: blur(14px) saturate(1.2);
-  /* iOS 上不单独提成合成层时，模糊层不会跟着重绘，会一直糊着旧内容 */
   transform: translateZ(0);
+  pointer-events: none;
 }
 /* 老浏览器/关掉模糊的设备：直接给不透明底色，别让文字压在列表上 */
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-  .player { background: var(--panel); }
+  .player::before { background: var(--panel); }
 }
 .pl-top { display: grid; grid-template-columns: 60px 1fr auto; gap: 10px; align-items: center; }
 .pl-img { width: 60px; height: 40px; border-radius: 7px; background: var(--panel2); object-fit: cover; display: block; }
@@ -451,37 +541,13 @@ button { font: inherit; color: inherit; cursor: pointer; }
 /* 倍速选择：点速度数字，在按钮上方弹出预设列表 */
 .speed-wrap { position: relative; }
 .speed-menu {
-  position: absolute;
   right: 0;
   bottom: calc(100% + 8px);
-  z-index: 30;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
   min-width: 88px;
-  padding: 5px;
-  background: var(--panel2);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  box-shadow: 0 8px 26px rgba(0, 0, 0, .35);
+  --menu-shift: 4px;              /* 向上展开：从下方一点浮上来 */
+  transform-origin: bottom right;
 }
-:root[data-theme="light"] .speed-menu { box-shadow: 0 8px 26px rgba(20, 30, 60, .18); }
-/* 有 display:flex 的浮层必须显式处理 hidden，否则 [hidden] 会被作者样式盖掉，
-   一进页面就摊开着 */
-.speed-menu[hidden] { display: none; }
-.speed-menu button {
-  border: 0;
-  background: transparent;
-  border-radius: 7px;
-  padding: 8px 12px;
-  font-size: 13px;
-  text-align: left;
-  color: var(--fg);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-.speed-menu button.on { background: var(--sel); }
-.speed-menu button:active { background: var(--pressed); }
+.speed-menu .menu-item { font-variant-numeric: tabular-nums; }
 /* 列表末尾的「编辑…」 */
 .speed-menu .speed-add { color: var(--dim); }
 

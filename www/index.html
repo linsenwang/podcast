@@ -56,14 +56,22 @@
 
   <div class="toolbar">
     <button id="theme" class="icon-btn" title="主题"><span id="themeIco" class="ico ico-auto"></span></button>
-    <select id="feedSel" aria-label="选择订阅源"></select>
+    <!-- 订阅源：原生 select 的下拉面板没法改样式，这里按钮 + 自绘菜单，
+         外观和「筛选」「倍速」两个下拉保持一致 -->
+    <div class="feed-wrap">
+      <button id="feedBtn" class="feed-btn" type="button" aria-label="选择订阅源" aria-haspopup="menu" aria-expanded="false">
+        <span id="feedLabel" class="feed-label">全部订阅</span>
+        <span class="ico ico-expand"></span>
+      </button>
+      <div id="feedMenu" class="menu feed-menu" role="menu" aria-label="订阅源" hidden></div>
+    </div>
     <!-- 排序 / 隐藏已完播 / 最近完播收进一个下拉，点「筛选」才展开 -->
     <div class="filter-wrap">
       <button id="filterBtn" class="icon-btn filter-btn" type="button" title="筛选" aria-label="筛选" aria-haspopup="true" aria-expanded="false"><span class="ico ico-filter"></span></button>
-      <div id="filterMenu" class="filter-menu" hidden>
-        <button id="sortBtn" class="chip" type="button" aria-label="排序方式"></button>
-        <button id="hideBtn" class="chip" type="button" role="switch" aria-checked="true">隐藏已完播</button>
-        <button id="doneBtn" class="chip" type="button" role="switch" aria-checked="false">最近完播</button>
+      <div id="filterMenu" class="menu filter-menu" hidden>
+        <button id="sortBtn" class="menu-item" type="button" aria-label="排序方式"></button>
+        <button id="hideBtn" class="menu-item" type="button" role="switch" aria-checked="true">隐藏已完播</button>
+        <button id="doneBtn" class="menu-item" type="button" role="switch" aria-checked="false">最近完播</button>
       </div>
     </div>
     <button id="refresh" class="icon-btn" title="刷新全部订阅" aria-label="刷新"><span class="ico ico-refresh"></span></button>
@@ -102,7 +110,7 @@
       <!-- 倍速：点这个数字，在上方弹出预设列表 -->
       <div class="speed-wrap">
         <button id="plSpeed" class="speed-btn" title="倍速" aria-label="播放倍速" aria-haspopup="menu" aria-expanded="false">2×</button>
-        <div id="speedMenu" class="speed-menu" role="menu" aria-label="播放倍速" hidden></div>
+        <div id="speedMenu" class="menu speed-menu" role="menu" aria-label="播放倍速" hidden></div>
       </div>
     </div>
   </div>

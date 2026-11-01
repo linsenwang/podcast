@@ -25,6 +25,7 @@ const SHELL = [
   './icons/replay_10.svg',
   './icons/forward_30.svg',
   './icons/add.svg',
+  './icons/arrow_drop_down.svg',
   './icons/filter_list.svg',
   './icons/brightness_auto.svg',
   './icons/light_mode.svg',

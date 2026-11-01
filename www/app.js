@@ -1378,6 +1378,7 @@ function renderSpeedMenu() {
   for (const v of settings.speeds) {
     const b = document.createElement('button');
     b.type = 'button';
+    b.className = 'menu-item';
     b.dataset.v = String(v);
     b.setAttribute('role', 'menuitemradio');
     b.textContent = v + '×';
@@ -1392,7 +1393,7 @@ function renderSpeedMenu() {
   }
   const add = document.createElement('button');
   add.type = 'button';
-  add.className = 'speed-add';
+  add.className = 'menu-item speed-add';
   add.setAttribute('role', 'menuitem');
   add.textContent = '编辑…';
   add.addEventListener('click', () => {
@@ -1412,7 +1413,8 @@ function closeSpeedMenu() {
 function toggleSpeedMenu() {
   const menu = $('speedMenu');
   if (!menu.hidden) { closeSpeedMenu(); return; }
-  closeFilterMenu();               // 两个浮层别同时开着
+  closeFilterMenu();
+  closeFeedMenu();                 // 三个浮层别同时开着
   menu.hidden = false;
   $('plSpeed').setAttribute('aria-expanded', 'true');
 }
@@ -1428,8 +1430,29 @@ function toggleFilterMenu() {
   const menu = $('filterMenu');
   if (!menu.hidden) { closeFilterMenu(); return; }
   closeSpeedMenu();
+  closeFeedMenu();
   menu.hidden = false;
   $('filterBtn').setAttribute('aria-expanded', 'true');
+}
+
+// 订阅源下拉：菜单内容由 syncFeedSelect() 按 feeds 生成
+function closeFeedMenu() {
+  const menu = $('feedMenu');
+  if (menu.hidden) return;
+  menu.hidden = true;
+  $('feedBtn').setAttribute('aria-expanded', 'false');
+}
+
+function toggleFeedMenu() {
+  const menu = $('feedMenu');
+  if (!menu.hidden) { closeFeedMenu(); return; }
+  closeFilterMenu();
+  closeSpeedMenu();
+  menu.hidden = false;
+  $('feedBtn').setAttribute('aria-expanded', 'true');
+  // 订阅多到要滚时，把当前选中项带到可见处
+  const on = menu.querySelector('.menu-item.on');
+  if (on && on.scrollIntoView) on.scrollIntoView({ block: 'nearest' });
 }
 
 function openSpeedEdit() {
@@ -1530,6 +1553,7 @@ $('plSpeed').addEventListener('click', toggleSpeedMenu);
 document.addEventListener('click', (ev) => {
   if (!ev.target.closest('.speed-wrap')) closeSpeedMenu();
   if (!ev.target.closest('.filter-wrap')) closeFilterMenu();
+  if (!ev.target.closest('.feed-wrap')) closeFeedMenu();
 });
 
 $('theme').addEventListener('click', () => {
@@ -1546,11 +1570,7 @@ $('speedInput').addEventListener('keydown', (ev) => {
   else if (ev.key === 'Escape') { ev.preventDefault(); closeSpeedEdit(); }
 });
 
-$('feedSel').addEventListener('change', (e) => {
-  settings.feed = e.target.value;
-  saveSettings();
-  render();
-});
+$('feedBtn').addEventListener('click', toggleFeedMenu);
 
 // 筛选下拉：里面还是原来那三个按钮，点「筛选」才展开
 $('filterBtn').addEventListener('click', toggleFilterMenu);
@@ -1622,21 +1642,38 @@ function syncToolbar() {
 }
 
 function syncFeedSelect() {
-  const sel = $('feedSel');
   if (settings.feed && !feeds.some((f) => f.id === settings.feed)) settings.feed = '';
-  sel.innerHTML = '';
-  const all = document.createElement('option');
-  all.value = '';
-  // all.textContent = '全部订阅（' + feeds.length + '）';
-  all.textContent = '全部订阅';
-  sel.appendChild(all);
-  for (const f of feeds) {
-    const o = document.createElement('option');
-    o.value = f.id;
-    o.textContent = f.title;
-    sel.appendChild(o);
-  }
-  sel.value = settings.feed;
+  const menu = $('feedMenu');
+  menu.innerHTML = '';
+
+  const addItem = (id, title) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'menu-item';
+    b.dataset.feed = id;
+    b.setAttribute('role', 'menuitemradio');
+    const on = id === settings.feed;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-checked', String(on));
+    b.textContent = title;
+    b.addEventListener('click', () => {
+      settings.feed = id;
+      saveSettings();
+      closeFeedMenu();
+      syncFeedSelect();      // 刷新按钮上的当前项和菜单里的选中态
+      render();
+    });
+    menu.appendChild(b);
+  };
+
+  addItem('', '全部订阅');
+  for (const f of feeds) addItem(f.id, f.title);
+
+  // 按钮上显示当前订阅源，名字长了靠 .feed-label 省略
+  const cur = feeds.find((f) => f.id === settings.feed);
+  const label = cur ? cur.title : '全部订阅';
+  $('feedLabel').textContent = label;
+  $('feedBtn').setAttribute('aria-label', '选择订阅源，当前：' + label);
 }
 
 // iOS 后台常把整个 PWA 回收掉，重开时内存里的 current 已经没了。
