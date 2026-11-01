@@ -10,8 +10,8 @@
 # 新源的单集封面如果不在缩略图白名单里（hdslb.com / ytimg.com / ggpht.com /
 # fireside.fm / xyzcdn.net），还要在 podcast/thumbs/app.py 的 ALLOWED_DOMAINS 里加域名。
 
-latepost	晚点聊 LateTalk	https://feeds.fireside.fm/latetalk/rss
-fuyoutiandi	蜉蝣天地 Meanders	https://feeds.fireside.fm/fuyoutiandi/rss
+latepost	晚点聊	https://feeds.fireside.fm/latetalk/rss
+fuyoutiandi	蜉蝣天地	https://feeds.fireside.fm/fuyoutiandi/rss
 shanyouhu	山有虎	https://feeds.fireside.fm/shanyouhu/rss
-sv101	硅谷101（播客）	https://feeds.fireside.fm/sv101/rss
-xyzfm	张小珺Jùn｜商业访谈录	https://feed.xyzfm.space/dk4yh3pkpjp3
+sv101	硅谷101	https://feeds.fireside.fm/sv101/rss
+xyzfm	张小珺	https://feed.xyzfm.space/dk4yh3pkpjp3

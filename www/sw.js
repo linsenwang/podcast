@@ -6,6 +6,7 @@
 const VERSION = 'podcast-v5';
 const SYNC_PATH = new URL('sync/', self.registration.scope).pathname;
 const ICONS_PATH = new URL('icons/', self.registration.scope).pathname;
+const FONTS_PATH = new URL('fonts/', self.registration.scope).pathname;
 const THUMB_PATH = new URL('thumb', self.registration.scope).pathname;
 
 const SHELL = [
@@ -63,8 +64,9 @@ async function networkFirst(req) {
   }
 }
 
-// 图标是纯静态资源（预缓存里已有），缓存优先：省掉每次打开都要重拉的十来个请求。
-// 代价是换图标不会立刻生效 —— 改图标时把 VERSION 一起改掉即可。
+// 图标和字体是纯静态资源，缓存优先：省掉每次打开都要重拉的十来个请求，
+// 也免得 8MB 的字体每次加载都回源确认。代价是换了文件不会立刻生效 ——
+// 换图标/字体时把 VERSION 一起改掉即可。
 async function cacheFirst(req) {
   const cache = await caches.open(VERSION);
   const hit = await cache.match(req, { ignoreSearch: true });
@@ -96,7 +98,7 @@ self.addEventListener('fetch', (e) => {
   // 就行，不必再往 SW 缓存里塞几百张小图
   if (url.pathname.startsWith(THUMB_PATH)) return;
 
-  if (url.pathname.startsWith(ICONS_PATH)) {
+  if (url.pathname.startsWith(ICONS_PATH) || url.pathname.startsWith(FONTS_PATH)) {
     e.respondWith(cacheFirst(req));
     return;
   }
