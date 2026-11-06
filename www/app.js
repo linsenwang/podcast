@@ -13,6 +13,12 @@ const SYNC_BASE = new URL('sync/', document.baseURI).href;  // nginx WebDAV 目�
 const THUMB_BASE = new URL('thumb', document.baseURI).href;  // 服务端缩略图接口
 const COVER_FALLBACK = new URL('icons/icon-192.png', document.baseURI).href; // 没封面时的占位图（PWA 图标）
 const STALE_MS = 15 * 60 * 1000;   // 超过这个时间就重取单个 feed
+const FEED_POOL = 8;               // 平时同时刷新几个 feed
+const FEED_POOL_PLAYING = 1;       // 播放中只留一路：音频优先，刷新源靠边
+const FEED_TIMEOUT_MS = 30000;     // 单个源最多等这么久；长尾源不能一直占着连接
+const FEED_SLOT_POLL = 250;        // 等刷新槽位的轮询间隔
+const SYNC_TIMEOUT_MS = 5000;      // 同步优先级高，但也不能无限等
+const SYNC_BOOT_WAIT_MS = 1500;    // 启动时最多等同步这么久，剩下的转到后台
 const PAGE_SIZE = 60;              // 列表分批渲染，避免一次塞几千个节点
 const DONE_RATIO = 0.98;           // 播到这里就算完播
 const SPEEDS_REV = 2;               // 倍速预设表改版号：rev 2 起固定为 1.25/1.5/2/3
@@ -34,6 +40,7 @@ const LS_LAMPORT = 'podcast.lamport';
 
 const $ = (id) => document.getElementById(id);
 const sentinel = $('sentinel');
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ================= 本地存储 ================= */
 function readLS(key, def) {
@@ -169,11 +176,23 @@ function schedulePush(delay) {
   pushTimer = setTimeout(() => { pushTimer = 0; pushDueAt = 0; syncPush(); }, delay);
 }
 
+// 同步请求的兜底超时：它是优先级最高的网络动作，但不能因为服务端不回包
+// 就一直占着 pushing / pulling 状态，把后面的同步全部堵死。
+async function fetchSync(url, opts) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, SYNC_TIMEOUT_MS);
+  try {
+    return await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function syncPush() {
   if (pushing) return;
   pushing = true;
   try {
-    const res = await fetch(SYNC_BASE + DEVICE_FILE, {
+    const res = await fetchSync(SYNC_BASE + DEVICE_FILE, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(syncPayload()),
@@ -203,7 +222,7 @@ async function syncPull() {
   try {
     let list;
     try {
-      const res = await fetch(SYNC_BASE, { cache: 'no-store' });
+      const res = await fetchSync(SYNC_BASE, { cache: 'no-store' });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       list = await res.json();
       syncBroken = false;
@@ -218,10 +237,12 @@ async function syncPull() {
       .filter((n) => n !== DEVICE_FILE);
     if (!names.length) return;
 
+    // 设备文件都很小，多开几路能明显缩短同步；同步本身又要给刷新源让路，
+    // 所以它自己快一点，整体就少堵一会儿。
     const docs = [];
-    await pool(names, 4, async (n) => {
+    await pool(names, 8, async (n) => {
       try {
-        const r = await fetch(SYNC_BASE + n, { cache: 'no-store' });
+        const r = await fetchSync(SYNC_BASE + n, { cache: 'no-store' });
         if (r.ok) docs.push(await r.json());
       } catch (_) { /* 单个设备文件坏了不影响其它 */ }
     });
@@ -280,9 +301,22 @@ function mergeDocs(docs) {
 
   if (!merged) return;
   saveProgress(true);
+  syncRestoredPosition();
   render();
   setStatus('已从其它设备同步');
   schedulePush(2000);   // 合并结果回写，别的设备下次也能拿到
+}
+
+// 同步可能在播放器已经摆回来之后才完成：把断点位置跟到最新。
+// 只处理"还没开始播、音源也还没装"的恢复态；用户播过或拖过之后就不要动。
+function syncRestoredPosition() {
+  if (!current || wantPlay || audio.getAttribute('src') || audio.readyState >= 1) return;
+  const pr = progress[current.id];
+  const p = pr && !isFinished(pr) && pr.p > 0 ? pr.p : 0;
+  if (!(p > 0) || (pendingSeek != null && pendingSeek >= p)) return;
+  pendingSeek = p;
+  updateTimes();
+  updateSeekBar();
 }
 
 /* ================= IndexedDB：单集缓存 ================= */
@@ -397,9 +431,9 @@ function epId(feedId, ep) { return feedId + '/' + (ep.g || ep.u); }
 function isFinished(pr) {
   return !!pr && (pr.f === 1 || (pr.d > 0 && pr.p / pr.d >= DONE_RATIO));
 }
-// 顶栏消息只短暂停留：每来一条新消息就重新计时，5 秒后淡出并收起状态行。
+// 顶栏消息只短暂停留：每来一条新消息就重新计时，2 秒后淡出并收起状态行。
 // STATUS_FADE 与 style.css 里 .status 的 transition 时长一致，收起完再清空文字。
-const STATUS_TTL = 5000;
+const STATUS_TTL = 2000;
 const STATUS_FADE = 300;
 let statusTimer = 0;
 function setStatus(s) {
@@ -513,6 +547,96 @@ async function pool(items, limit, fn) {
   await Promise.all(workers);
 }
 
+/* 刷新源的网络闸门：同步和播放优先。
+ * 平时 8 路并发；正在从其它设备同步（pulling）或用户想播放（wantPlay）时
+ * 只留 1 路，把连接和带宽让给它们。
+ * 已经在跑的 feed 请求由 holdFeedsForPlayback() 当场撤掉，不用等它自己超时 ——
+ * 长尾源最占连接，正是它会把音频起播堵在后面。
+ */
+let feedActive = 0;
+const feedControllers = new Set();
+
+function feedLimit() { return (wantPlay || pulling) ? FEED_POOL_PLAYING : FEED_POOL; }
+
+function holdFeedsForPlayback() {
+  if (!feedControllers.size) return;
+  for (const c of feedControllers) {
+    try { c.abort(); } catch (_) {}
+  }
+  feedControllers.clear();
+}
+
+async function acquireFeedSlot() {
+  while (feedActive >= feedLimit()) {
+    await delay(FEED_SLOT_POLL);
+  }
+  feedActive++;
+}
+function releaseFeedSlot() {
+  if (feedActive > 0) feedActive--;
+}
+
+// 刷新单个源。返回 'updated' / 'ok' / 'unchanged'（304）/ 'failed' / 'deferred'。
+// 每个源用自己的 AbortController：既能在超时后放弃长尾源，
+// 也能在用户点播放时被 holdFeedsForPlayback() 立即撤掉。
+async function refreshFeed(f) {
+  await acquireFeedSlot();
+  let timedOut = false;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { ctrl.abort(); } catch (_) {}
+  }, FEED_TIMEOUT_MS);
+  feedControllers.add(ctrl);
+
+  try {
+    // feed 大部分时候没变，带上 If-Modified-Since 就能只收一个 304 ——
+    // 不但省掉整个体的下载，连 DOMParser 和重建对象都省了
+    const headers = {};
+    if (f.lastModified && f.episodes.length) headers['If-Modified-Since'] = f.lastModified;
+
+    const res = await fetch(f.url, { cache: 'no-store', headers: headers, signal: ctrl.signal });
+    if (res.status === 304) {
+      f.fetchedAt = Date.now();
+      f.error = '';
+      await dbPut({
+        id: f.id, fetchedAt: f.fetchedAt, lastModified: f.lastModified, episodes: f.episodes,
+      });
+      return 'unchanged';
+    }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+
+    // 上游经常回 200 但内容没变，逐个比较 guid 才知道到底有没有新单集
+    const seen = new Set(f.episodes.map((e) => e.g || e.u));
+    const episodes = parseFeed(await res.text());
+    const updated = episodes.some((e) => !seen.has(e.g || e.u));
+    f.episodes = episodes;
+    f.fetchedAt = Date.now();
+    f.lastModified = res.headers.get('Last-Modified') || f.lastModified || '';
+    f.error = '';
+    await dbPut({
+      id: f.id, fetchedAt: f.fetchedAt, lastModified: f.lastModified, episodes: f.episodes,
+    });
+    if (updated) renderSoon();   // 有更新就立刻让它冒出来，不等其它源
+    return updated ? 'updated' : 'ok';
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      if (timedOut) {
+        f.error = '超时';
+        return 'failed';
+      }
+      // 给播放让路：不算失败，保留旧数据，排到下次刷新再补
+      return 'deferred';
+    }
+    f.error = String((err && err.message) || err);
+    return 'failed';
+  } finally {
+    clearTimeout(timer);
+    feedControllers.delete(ctrl);
+    releaseFeedSlot();
+  }
+}
+
 async function refresh(force) {
   if (refreshing) return;
   refreshing = true;
@@ -536,50 +660,30 @@ async function refresh(force) {
     render();
 
     const stale = feeds.filter((f) => force || Date.now() - f.fetchedAt > STALE_MS);
-    let done = 0, failed = 0, unchanged = 0;
-    // 并发 8：链路是 HTTP/2（tailscale serve 协商出来的），多路复用，
-    // 所以不受浏览器"单域名 6 连接"的限制，开高一点能明显缩短等待。
-    await pool(stale, 8, async (f) => {
-      let updated = false;   // 只有这个 feed 真的多了新单集才重绘
-      try {
-        // feed 大部分时候没变，带上 If-Modified-Since 就能只收一个 304 ——
-        // 不但省掉整个体的下载，连 DOMParser 和重建对象都省了
-        const headers = {};
-        if (f.lastModified && f.episodes.length) headers['If-Modified-Since'] = f.lastModified;
-
-        const res = await fetch(f.url, { cache: 'no-store', headers: headers });
-        if (res.status === 304) {
-          f.fetchedAt = Date.now();
-          f.error = '';
-          unchanged++;
-        } else {
-          if (!res.ok) throw new Error('HTTP ' + res.status);
-          // 上游经常回 200 但内容没变，逐个比较 guid 才知道到底有没有新单集
-          const seen = new Set(f.episodes.map((e) => e.g || e.u));
-          const episodes = parseFeed(await res.text());
-          updated = episodes.some((e) => !seen.has(e.g || e.u));
-          f.episodes = episodes;
-          f.fetchedAt = Date.now();
-          f.lastModified = res.headers.get('Last-Modified') || f.lastModified || '';
-          f.error = '';
-        }
-        await dbPut({
-          id: f.id, fetchedAt: f.fetchedAt, lastModified: f.lastModified, episodes: f.episodes,
-        });
-      } catch (err) {
-        f.error = String((err && err.message) || err);
-        failed++;
+    let done = 0, failed = 0, unchanged = 0, deferred = 0;
+    // 仍是 8 个 worker：真正同时发几个请求由 acquireFeedSlot() 按播放状态决定。
+    // 播放开始后多出来的 worker 会等在槽位上，暂停后立刻续上。
+    const queue = stale.slice();
+    let next = 0;
+    await Promise.all(new Array(Math.min(FEED_POOL, queue.length)).fill(0).map(async () => {
+      while (next < queue.length) {
+        const kind = await refreshFeed(queue[next++]);
+        if (kind === 'deferred') { deferred++; continue; }
+        done++;
+        if (kind === 'failed') failed++;
+        else if (kind === 'unchanged') unchanged++;
+        setStatus('更新 ' + done + '/' + stale.length);
       }
-      setStatus('更新 ' + (++done) + '/' + stale.length);
-      if (updated) renderSoon();   // 有更新就立刻让它冒出来，不等其它源
-    });
+    }));
 
     clearTimeout(progressRenderTimer);
     progressRenderTimer = 0;
     pruneProgress();
     render();
     const stamp = new Date().toTimeString().slice(0, 5);
-    if (failed) setStatus(stamp + ' 更新完成，' + failed + ' 个失败');
+    const yieldNote = deferred ? '，' + deferred + ' 个源让位给播放' : '';
+    if (failed) setStatus(stamp + ' 更新完成，' + failed + ' 个失败' + yieldNote);
+    else if (deferred) setStatus(stamp + ' 已更新' + yieldNote + '，下次再补');
     else if (unchanged) setStatus(stamp + ' 已更新（' + unchanged + ' 个未变化）');
     else setStatus(stamp + ' 已更新');
   } catch (err) {
@@ -838,11 +942,15 @@ let lastAudioMoveAt = 0;    // currentTime 最近一次推进的时间
 let playWatchdog = 0;       // play() resolve 了却一直没声音时的兜底定时器
 let playAttempt = 0;        // 每次播放尝试的编号，防止旧定时器误伤新尝试
 let hiddenAt = 0;           // 切到后台的时间，回来时判断离开了多久
+let preloadAudio = null;    // 预加载下一集用的第二个元素（只 load，不 play）
+let preloadForId = '';      // 已经为哪一集预加载过下一集
+let lastPosStateAt = 0;     // setPositionState 的节流时间
 
 const STALL_RETRY_MAX = 3;
 const STALL_WAIT_MS = 5000;          // 第 n 次重试等 n*5 秒
 const PLAY_ALIVE_MS = 5000;          // 前台超过这么久没推进就当作没在响
 const PLAY_WATCHDOG_MS = 4000;       // play() 之后多久还没声音就强制换源重试
+const NEXT_PRELOAD_LEAD = 180;       // 剩这么多秒时预载下一集，后台切集不用现等网络
 
 // 网络断流时浏览器会把"已经缓冲到哪"当成整个音频资源的结尾：duration 会变成一个
 // 明显偏小的值（也可能直接是 NaN / Infinity），播到那儿就触发 ended。
@@ -966,10 +1074,14 @@ function maybeWrapped(from, to) {
 // 重新走一遍资源选择，再定位回断点播放。
 // 后台被系统挂起/中断之后，元素可能停在"请求过播放但没有任何数据"甚至 error 的状态，
 // 这时光调 play() 不会重新拉流，必须 load()。
-// 先清空 src 再设回同一个地址：iOS 26 的 PWA 重开后，元素会卡在"有 src 但不出声"
-// 的状态，直接再赋一次同样的 URL 不一定能重新走加载流程（WebKit bug 295518）。
-function reloadAt(pos, fromWatchdog) {
+// hard 只在两种情况传 true：iOS 26 的 PWA 重开后"有 src 却不出声"（WebKit bug
+// 295518），以及 watchdog 确认元素卡死。那种情况下要先清空 src 再设回同一个地址，
+// 才能强制 WebKit 重新走加载流程。普通恢复不要清 src —— 重建音源会丢掉现有的
+// audio session 和缓冲，在 iOS 后台反而更容易把播放掐断。
+function reloadAt(pos, hard) {
   if (!current) return;
+  wantPlay = true;                 // 重新拉流期间刷新源保持在 1 路
+  holdFeedsForPlayback();          // 正在跑的 feed 请求当场让路
   clearPlayWatchdog();
   cancelResume();
   pendingSeek = pos > 0 ? pos : null;
@@ -980,12 +1092,15 @@ function reloadAt(pos, fromWatchdog) {
   sourceFresh = false;
   armAudioSession();
   try { audio.pause(); } catch (_) {}
-  try { audio.removeAttribute('src'); audio.load(); } catch (_) {}
+  if (hard) {
+    try { audio.removeAttribute('src'); audio.load(); } catch (_) {}
+  }
   audio.src = toLocal(current.e.u);
   audio.load();
   audio.playbackRate = settings.speed;
-  wantPlay = true;
-  armPlayWatchdog(pendingSeek || 0, !!fromWatchdog);
+  // hard 就是"已经重试过一轮"的标记：watchdog 再失败一次就直接提示用户，
+  // 不要无限换源重试。
+  armPlayWatchdog(pendingSeek || 0, !!hard);
   callPlay();
 }
 
@@ -995,16 +1110,22 @@ function requestPlay() {
   armAudioSession();                   // 必须在手势里、play() 之前
   cancelResume();                      // 用户/系统主动操作了，撤掉待执行的自动重试
   wantPlay = true;
+  holdFeedsForPlayback();              // 音频要起播，正在刷新的源先让路
+  audio.loop = true;                   // 任何路径都不要让元素自然 ended
   audio.playbackRate = settings.speed;
   const at = currentPosition() || savedPosition(current);
   // 上次加载失败、系统把 src 清掉了、断流停在截断的结尾，或这是本页第一次播放：
   // 直接 play() 救不回来。iOS 26 的 PWA 重开后尤其明显，必须在 play() 前
-  // 重新设一遍 src（WebKit bug 295518）。
-  const needReset = !audio.getAttribute('src') || audio.error || needReload
-    || (!playedThisPage && !sourceFresh);
+  // 重新走一遍加载（WebKit bug 295518）。
+  const coldStart = !playedThisPage && !sourceFresh;
+  const broken = !audio.getAttribute('src') || !!audio.error || needReload;
+  // 例外：后台按锁屏播放键时，只要元素还有完好的源，就原地 play()。
+  // 在后台重建音源开不出新的 audio session，iOS 会直接拒绝，反而更接不回来。
+  const canPlayInPlace = !!audio.getAttribute('src') && !audio.error && !needReload;
+  const needReset = broken || (coldStart && (!canPlayInPlace || !document.hidden));
   sourceFresh = false;
   if (needReset) {
-    reloadAt(at, false);
+    reloadAt(at, coldStart && !document.hidden);
     return;
   }
   armPlayWatchdog(at, false);
@@ -1040,17 +1161,51 @@ function resumeIfNeeded(awayMs) {
     return;
   }
   const at = currentPosition() || savedPosition(current);
-  // 元素没源 / 报错 / 断流 / 在后台待了太久：重新走一遍资源选择。
-  // 离开超过一分钟，WebKit 很可能已经把元素挂起（iOS 26 上还会卡成静音），
-  // 这时 play() 不一定能救回来。只是短时间被系统暂停的，先原地 play() ——
-  // 不要重设 src，免得把现有的 audio session 和缓冲一起丢掉。
-  if (!audio.getAttribute('src') || audio.error || needReload || awayMs > 60000) {
+  // 只有元素真的坏了（没源 / 报错 / 断流）才重建音源。离开多久都不作为
+  // 重建的理由：iOS 只是把元素暂停时，原地 play() 就能接回来，而重设 src
+  // 会丢掉 audio session 和缓冲，反而可能把后台播放彻底弄断。
+  if (!audio.getAttribute('src') || audio.error || needReload) {
     reloadAt(at, false);
     return;
   }
   armAudioSession();
   armPlayWatchdog(at, false);
   callPlay();
+}
+
+// 快播完时预载下一集：后台没有用户手势，换源后要尽快有数据，
+// 否则 iOS 容易把"新音源还没就绪"当成播放失败。这里只 load 不 play，
+// muted 保证它不会抢当前这一集的 Now Playing。
+function preloadNextEpisode() {
+  if (!current || preloadForId === current.id) return;
+  const d = audio.duration;
+  if (!isFinite(d) || d <= 0 || d - audio.currentTime > NEXT_PRELOAD_LEAD) return;
+  preloadForId = current.id;
+  const next = nextEpisode();
+  if (!next) return;
+  if (!preloadAudio) {
+    preloadAudio = document.createElement('audio');
+    preloadAudio.preload = 'metadata';  // 只热身连接/元数据，不跟正在播的音频抢带宽
+    preloadAudio.muted = true;
+    preloadAudio.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(preloadAudio);
+  }
+  try {
+    preloadAudio.src = toLocal(next.e.u);
+    preloadAudio.load();
+  } catch (_) {}
+}
+
+// 换集时把预载元素停掉：它预载的往往正是刚切过来的这一集，
+// 不取消的话它会和主播放器同时下载同一个文件，把起播拖慢。
+function resetPreload() {
+  preloadForId = '';
+  if (!preloadAudio) return;
+  try {
+    preloadAudio.pause();
+    preloadAudio.removeAttribute('src');
+    preloadAudio.load();
+  } catch (_) {}
 }
 
 // loop 回卷到 0：这不是用户拖动，可能是真的播完了，也可能是网络断流时
@@ -1064,10 +1219,13 @@ function onTrackWrapped() {
     // 时长明显短于 feed 声明 → 断流，不是完播：停下来等网络恢复后从断点重试。
     if (!mediaDurationOk()) {
       try { audio.pause(); } catch (_) {}
-      audio.loop = false;            // 别让 seek 回断点时又触发一次回卷
+      // 不要关掉 loop：一旦 loop 被关，元素下次就可能在后台自然 ended，
+      // WebKit 会顺手关掉本页的 audio session，锁屏控制和续播全都回不来。
+      // 这里靠 manualSeekAt 标记这次回卷是"自己定位"，不会再次触发切集。
       needReload = true;             // 下次 play() 必须重新 load，回到断点
       const at = Math.max((progress[id] && progress[id].p) || 0, lastTime || 0);
-      try { manualSeekAt = Date.now(); audio.currentTime = at; } catch (_) {}
+      manualSeekAt = Date.now();
+      try { audio.currentTime = at; } catch (_) {}
       scheduleResume('音频被网络中断');
       return;
     }
@@ -1134,7 +1292,8 @@ audio.addEventListener('loadedmetadata', () => {
   }
   updateTimes();
   updateSeekBar();
-  updatePositionState();
+  updatePositionState(true);
+  preloadNextEpisode();
 });
 
 // loop 回卷时先改 currentTime 再发事件，seeking / timeupdate 哪个先到都接住。
@@ -1172,7 +1331,8 @@ audio.addEventListener('timeupdate', () => {
   const fillEl = bars.get(current.id);
   if (fillEl) fillEl.style.width = ((audio.currentTime / d) * 100).toFixed(1) + '%';
 
-  updatePositionState();
+  updatePositionState(false);
+  preloadNextEpisode();
 });
 
 // 浏览器自己认定"拿不到数据"了。先别急着重载，走原来的退避重试：
@@ -1181,11 +1341,16 @@ audio.addEventListener('stalled', () => {
   if (current && wantPlay && !document.hidden) scheduleResume('音频缓冲中断');
 });
 
-function updatePositionState() {
+// force=false 时最多一秒上报一次：锁屏面板会自己按上次的位置外推，
+// 不需要跟着 timeupdate 每 250ms 喂一次，高频 IPC 反而更容易被系统挂起。
+function updatePositionState(force) {
   if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState) return;
   if (!current) return;
+  const now = Date.now();
+  if (!force && now - lastPosStateAt < 1000) return;
   const d = displayDuration();
   if (!(d > 0)) return;
+  lastPosStateAt = now;
   try {
     navigator.mediaSession.setPositionState({
       duration: d,
@@ -1215,7 +1380,7 @@ function seekTo(t) {
   touchProgress(current.id, { p: t });
   saveProgress(true);
   updateTimes();
-  updatePositionState();
+  updatePositionState(true);
 }
 
 function seekBy(delta) {
@@ -1232,6 +1397,7 @@ function setPlayIcon(playing) {
 }
 audio.addEventListener('play', () => {
   if (current) wantPlay = true;    // 系统默认控件直接 play() 时也把意图接回来
+  holdFeedsForPlayback();          // 不管是哪条路径触发，音频都优先拿连接
   setPlayIcon(true);
   syncPlaybackState();
   startSeekTicker();
@@ -1239,6 +1405,7 @@ audio.addEventListener('play', () => {
 audio.addEventListener('playing', () => {
   playedThisPage = true;           // iOS 26 的"重开后静默失败"兜底可以收工了
   lastAudioMoveAt = Date.now();
+  audio.loop = true;               // 任何路径都不要让元素自然 ended
   clearPlayWatchdog();
   cancelResume();                  // 自己缓冲好了，不用再重试
   armAudioSession();
@@ -1246,7 +1413,9 @@ audio.addEventListener('playing', () => {
   // 先把 metadata / playbackState 摆好，再注册 handler，顺序稳一点。
   if (current) updateMediaSession(current);
   syncPlaybackState();
+  updatePositionState(true);
   setupMediaSession();
+  preloadNextEpisode();
   const st = $('status').textContent;
   if (st.slice(0, 4) === '播放失败' || st.indexOf('重试') >= 0) setStatus('');
 });
@@ -1256,13 +1425,16 @@ audio.addEventListener('pause', () => {
   setPlayIcon(false);
   saveProgress(true);
   syncPlaybackState();
-  updatePositionState();     // 暂停后锁屏面板要停在这个位置，否则滑条会回跳到旧值
+  updatePositionState(true); // 暂停后锁屏面板要停在这个位置，否则滑条会回跳到旧值
   // 暂停状态下锁屏面板还要能再点播放：iOS 可能在后台把 handler 丢掉，
   // 这里再补注册一次，播放键才不会没反应。
   setupMediaSession();
 });
 audio.addEventListener('ended', () => {
   stopSeekTicker();
+  // ended 一旦放出去，WebKit 就会关掉 audio session（后台无法再打开）。
+  // 正常路径有 loop 兜着不会走到这里；这里只是最后的保险。
+  audio.loop = true;
   if (current && !playbackCompleted()) {
     // 网络断流被当成"播完"了：记下位置，不标完播、不跳集，改成等网络恢复续播
     touchProgress(current.id, {
@@ -1289,8 +1461,18 @@ audio.addEventListener('error', () => {
   if (!current || !audio.getAttribute('src')) return;
   // 只是启动时摆回来的播放器、用户还没点播放：不重试，也别弹错误
   if (!wantPlay) return;
+  const why = '音频加载失败（code ' + (audio.error ? audio.error.code : '?') + '）';
+  // 后台的 setTimeout 会被冻住，等退避重试等于永远不会重试。
+  // 在 error 事件里当场重建一次音源，还有机会接住网络抖动；重试次数照常受限。
+  if (document.hidden && stallRetry < STALL_RETRY_MAX) {
+    stallRetry++;
+    const at = currentPosition() || savedPosition(current)
+      || (progress[current.id] && progress[current.id].p) || 0;
+    reloadAt(at, false);
+    return;
+  }
   // 加载失败同样不跳集，交给重试
-  scheduleResume('音频加载失败（code ' + (audio.error ? audio.error.code : '?') + '）');
+  scheduleResume(why);
 });
 
 function updateTimes() {
@@ -1415,6 +1597,9 @@ function play(it) {
   // 暂停请用播放器上的按钮。
   if (same && wantPlay) { requestPlay(); return; }
 
+  wantPlay = true;                         // 先把刷新源降到 1 路
+  holdFeedsForPlayback();                  // 正在跑的 feed 请求当场让路，别跟音频抢连接
+  armAudioSession();                       // 必须在用户手势里、动音源之前
   cancelResume();                          // 用户自己操作了，撤掉待执行的自动重试
   clearPlayWatchdog();                     // 上一次尝试的兜底定时器作废
   audio.pause();                           // 换源前先 pause：iOS 只有自然 ended 才关 session
@@ -1438,6 +1623,7 @@ function play(it) {
   } else {
     stallRetry = 0;                        // 换集：重试计数从头算
     stallFrom = 0;
+    resetPreload();                        // 新的一集，停掉旧预载、重新安排
     const pr = progress[it.id];
     pendingSeek = pr && !isFinished(pr) && pr.p > 5 ? pr.p : 0; // 断点续播
     audio.src = toLocal(it.e.u);
@@ -1457,6 +1643,9 @@ function play(it) {
 function onPlayError(err) {
   if (err && err.name === 'AbortError') return;
   clearPlayWatchdog();
+  // 后台被拒绝（NotAllowedError）时保留播放意图：回到前台还能自动接上。
+  // 这里若清掉 wantPlay，回前台 resumeIfNeeded() 会直接早退，就永远续不上了。
+  if (err && err.name === 'NotAllowedError' && document.hidden) return;
   // 没真正开始播，就把意图清掉，否则按钮会卡在"暂停"、下一次点击又被当成暂停
   wantPlay = false;
   // 已经排了重试就别覆盖 —— error 事件给出的提示（还能重试几次）比这句有用
@@ -1692,6 +1881,7 @@ $('plClose').addEventListener('click', () => {
   wantPlay = false;
   clearPlayWatchdog();
   cancelResume();
+  resetPreload();
   closeSpeedMenu();
   closeSpeedEdit();
   saveProgress(true);
@@ -1780,7 +1970,7 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     hiddenAt = Date.now();
     saveProgress(true);
-    updatePositionState();
+    updatePositionState(true);
   } else {
     const away = hiddenAt ? Date.now() - hiddenAt : 0;
     hiddenAt = 0;
@@ -1900,7 +2090,8 @@ async function boot() {
 
   // 先用缓存渲染，秒开；再去后台对账
   const cachedIndex = readLS(LS_INDEX, null);
-  if (cachedIndex && cachedIndex.feeds && cachedIndex.feeds.length) {
+  const hasCache = !!(cachedIndex && cachedIndex.feeds && cachedIndex.feeds.length);
+  if (hasCache) {
     backendOrigin = cachedIndex.backendOrigin || null;
     feeds = cachedIndex.feeds.map((f) => Object.assign({}, f, { episodes: [], fetchedAt: 0 }));
     const cached = new Map((await dbGetAll()).map((r) => [r.id, r]));
@@ -1914,14 +2105,17 @@ async function boot() {
     }
     syncFeedSelect();
     render();
-    syncPull();               // 与刷新 feed 并行；拉到新数据会自己重绘
-    await refresh(false);
-  } else {
-    await refresh(true);
-    syncPull();
   }
-  syncFeedSelect();
+
+  // 播放器先用本地缓存摆回来，不排在同步/刷新后面
   restorePlayer();
+
+  // 同步优先，但启动只等一小会儿：拿到最新进度就够，慢的部分转到后台。
+  // 它继续跑的同时 pulling 仍会让刷新源保持 1 路，所以优先级不丢。
+  await Promise.race([syncPull(), delay(SYNC_BOOT_WAIT_MS)]);
+  await refresh(!hasCache);
+  syncFeedSelect();
+  restorePlayer();          // 首次启动此时才拿到 feed 数据，再试一次
 
   new IntersectionObserver((entries) => {
     if (entries.some((e) => e.isIntersecting)) renderMore();

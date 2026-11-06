@@ -3,7 +3,7 @@
 
 // 图标被 SW 缓存优先接管了（见下面 cacheFirst），所以换图标必须提版本号，
 // 否则已经装过 PWA 的客户端会一直用缓存里那套旧图。
-const VERSION = 'podcast-v6';
+const VERSION = 'podcast-v7';
 const SYNC_PATH = new URL('sync/', self.registration.scope).pathname;
 const ICONS_PATH = new URL('icons/', self.registration.scope).pathname;
 const FONTS_PATH = new URL('fonts/', self.registration.scope).pathname;
@@ -49,18 +49,32 @@ self.addEventListener('activate', (e) => {
   );
 });
 
+// 单个网络请求最多占这么久：长尾 feed 卡住时，页面会先 abort（见 app.js 的
+// holdFeedsForPlayback），这里再兜一层，免得 SW 里的 fetch 还占着连接。
+// 比 app.js 的 FEED_TIMEOUT_MS（30s）再长一点，让页面自己的超时先做判断。
+const NET_TIMEOUT_MS = 35000;
+
 // 一律网络优先：这个 app 没有构建步骤，缓存优先会让改动要等下一次加载才生效；
 // 离线时回退到安装时预缓存的外壳 + 上次抓到的 feed（单集数据另有 IndexedDB 兜底）
 async function networkFirst(req) {
   const cache = await caches.open(VERSION);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, NET_TIMEOUT_MS);
+  // 页面主动取消（比如给播放让路）时，把取消传到 SW 自己的 fetch 上。
+  // 某些 WebKit 版本不会自动传播 fetch event 的 abort，这里显式接一下。
+  const onAbort = () => { try { ctrl.abort(); } catch (_) {} };
+  if (req.signal) req.signal.addEventListener('abort', onAbort);
   try {
-    const res = await fetch(req);
+    const res = await fetch(req, { signal: ctrl.signal });
     if (res && res.ok) cache.put(req, res.clone());
     return res;
   } catch (err) {
     const hit = await cache.match(req, { ignoreSearch: true });
     if (hit) return hit;
     return new Response('', { status: 504, statusText: 'offline' });
+  } finally {
+    clearTimeout(timer);
+    if (req.signal) req.signal.removeEventListener('abort', onAbort);
   }
 }
 
