@@ -29,10 +29,10 @@
   --track: #313131;        /* 进度条槽 */
   --playing: #222222;      /* 正在播的那行 */
   --sel: var(--bg);          /* 选中态底色（chip、勾、倍速） */
-  --done-off: #464646;     /* 未标完播的勾 */
   --on-accent: #fff;       /* 蓝底上的图标 */
   --accent-active: #3d78e8;
   --space-inline: 10px;
+  --ep-drawer-w: 64px;     /* 行尾右侧抽屉的宽度（「完播」按钮藏在里面） */
   --btn-height: 36px;
   --main-font-size: 15px;
   --dim-font-size: 10px;
@@ -68,7 +68,6 @@
   --track: #c9c9c966;
   --playing: var(--panel2);
   --sel: var(--bg);
-  --done-off: #c9c9c9;
   --on-accent: #fff;
   --accent-active: #2a62cf;
   --panel-glass: rgba(250, 250, 250, .72);
@@ -391,17 +390,35 @@ button { font: inherit; color: inherit; cursor: pointer; }
   padding-bottom: var(--player-h);
 }
 
+/* 一行 = 一条可横向拉动的轨道：前面是正常内容，后面是右侧抽屉。
+   抽屉平时收在右边屏幕外，向左拉（或键盘 Tab 到完播按钮）才露出来。 */
 .ep {
+  position: relative;
+  overflow: hidden;
+  /* 横向手势归 JS 处理，竖向仍然交给浏览器滚动列表 */
+  touch-action: pan-y;
+  /* 横拉时别顺手选中标题 / 弹出系统菜单 */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+.ep-track {
+  display: flex;
+  transition: transform .22s cubic-bezier(.2, .8, .2, 1);
+}
+.ep-slide {
+  flex: 0 0 100%;
+  min-width: 0;
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto 1fr;
   gap: calc(var(--space-inline)*0.8);
   align-items: center;
   /* padding: calc(var(--space-inline) * 0.4) calc(var(--space-inline) * 0.8) calc(var(--space-inline) * 0.4) var(--space-inline); */
   padding: 8px var(--space-inline);
-  padding-right: calc(var(--space-inline)*0.8);
   /* border-bottom: 1px solid var(--line); */
   min-height: 72px;
 }
+.ep.open .ep-track { transform: translateX(calc(-1 * var(--ep-drawer-w))); }
 /* 正在播的那行：从透明渐变到 --playing，顶部和相邻行衔接得自然些 */
 /* .ep.playing { background: linear-gradient(to bottom, transparent, var(--playing)); border-radius: 0 0 16px 16px;} */
 /* .ep.playing { background: var(--playing); border-radius: 0 0 16px 16px;} */
@@ -414,6 +431,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
   background: var(--panel);
   object-fit: cover;
   display: block;
+  -webkit-user-drag: none;
 }
 .ep-main { min-width: 0; }
 .ep-meta {
@@ -435,20 +453,29 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .ep-bar { height: 2px; background: var(--track); border-radius: 2px; margin-top: 7px; overflow: hidden; }
 .ep-bar > i { display: block; height: 100%; background: var(--accent); }
 
+/* 抽屉本身：露出后才看得到「完播」按钮 */
+.ep-drawer {
+  flex: 0 0 var(--ep-drawer-w);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  /* border-left: 1px solid var(--line); */
+}
 .ep-done {
-  /* border: 1px solid var(--line); */
   border: none;
   background: transparent;
-  color: var(--done-off);
-  border-radius: 50%;
-  /* width: 26px; */
-  /* height: 26px; */
+  color: var(--on-accent);   /* 拉出来就是为了点它，别用未选中那档低对比色 */
+  width: 100%;
+  height: 100%;
   padding: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
 }
-.ep-done[aria-pressed="true"] { border-color: var(--accent-dim); color: var(--accent); background: var(--sel); }
+.ep-done:active { background: var(--pressed); }
+.ep-done[aria-pressed="true"] { color: var(--accent); }
+.ep-drawer .ico-check { width: 18px; height: 18px; }
 
 .sentinel { height: 1px; }
 

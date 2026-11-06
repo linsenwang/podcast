@@ -365,6 +365,7 @@ let current = null;      // 正在播放的条目
 let refreshing = false;
 let progressRenderTimer = 0; // 刷新过程中按 feed 逐个重绘的节流句柄
 const bars = new Map();  // 单集 id -> 进度条 <i>
+let openRow = null;      // 右侧抽屉展开着的那一行（同时只允许一行）
 
 /* ================= 小工具 ================= */
 function tagText(root, name) {
@@ -739,6 +740,111 @@ function visibleEpisodes() {
   return out;
 }
 
+/* 行内右侧抽屉：默认收在屏幕外，「标记完播」藏在那里，向左拉一下才露出来。
+   竖直方向完全交给列表滚动（.ep 上的 touch-action: pan-y），只有横向位移明显
+   大于竖直时才接管手势，免得一碰就把列表锁死。 */
+const DRAWER_SLOP = 8;   // 超过这个位移才判断方向，手抖不算
+
+function setRowOpen(row, open) {
+  if (!row) return;
+  const track = row.querySelector('.ep-track');
+  if (track) track.style.transform = '';   // 去掉拖动时的行内位移，交回 CSS 的 .ep.open
+  row.classList.toggle('open', open);
+  if (open) {
+    if (openRow && openRow !== row) setRowOpen(openRow, false);
+    openRow = row;
+  } else if (openRow === row) {
+    openRow = null;
+  }
+}
+
+function attachRowDrawer(row, it) {
+  const track = row.querySelector('.ep-track');
+  const done = row.querySelector('.ep-done');
+  const drawerWidth = () => {
+    const d = row.querySelector('.ep-drawer');
+    return (d && d.offsetWidth) || 0;
+  };
+  let pid = null;            // 正在跟踪的 pointerId（null = 没有进行中的手势）
+  let startX = 0, startY = 0;
+  let baseX = 0, curX = 0, limit = 0;
+  let decided = false, dragging = false, swallowClick = false;
+
+  // 键盘 Tab 到「完播」按钮时把抽屉拉开，否则焦点落在看不见的按钮上
+  done.addEventListener('focus', () => {
+    if (!row.classList.contains('open')) setRowOpen(row, true);
+  });
+
+  row.addEventListener('pointerdown', (ev) => {
+    swallowClick = false;
+    if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+    if (ev.target.closest('.ep-done')) return;  // 按钮自己处理点击
+    pid = ev.pointerId;
+    startX = ev.clientX;
+    startY = ev.clientY;
+    limit = drawerWidth();
+    baseX = row.classList.contains('open') ? -limit : 0;
+    curX = baseX;
+    decided = false;
+    dragging = false;
+  });
+
+  row.addEventListener('pointermove', (ev) => {
+    if (pid === null || ev.pointerId !== pid) return;
+    const dx = ev.clientX - startX;
+    const dy = ev.clientY - startY;
+    if (!decided) {
+      if (Math.abs(dx) < DRAWER_SLOP && Math.abs(dy) < DRAWER_SLOP) return;
+      if (Math.abs(dy) >= Math.abs(dx)) { pid = null; return; }  // 竖滑 → 让列表滚
+      decided = true;
+      dragging = true;
+      track.style.transition = 'none';
+      if (openRow && openRow !== row) setRowOpen(openRow, false);
+      try { row.setPointerCapture(ev.pointerId); } catch (_) {}
+    }
+    curX = Math.max(-limit, Math.min(0, baseX + dx));
+    track.style.transform = curX ? 'translateX(' + curX + 'px)' : '';
+  });
+
+  row.addEventListener('pointerup', (ev) => {
+    if (pid === null || ev.pointerId !== pid) return;
+    if (dragging) {
+      track.style.transition = '';
+      setRowOpen(row, curX < -limit / 2);
+      swallowClick = true;
+      // 有些浏览器抬手后不再派发 click，留个兜底，别把下一次点击吃掉
+      setTimeout(() => { swallowClick = false; }, 400);
+    }
+    pid = null;
+    decided = false;
+    dragging = false;
+  });
+
+  row.addEventListener('pointercancel', (ev) => {
+    if (pid === null || ev.pointerId !== pid) return;
+    if (dragging) track.style.transform = '';  // 回到原来的开合位置
+    track.style.transition = '';
+    pid = null;
+    decided = false;
+    dragging = false;
+  });
+
+  row.addEventListener('click', (ev) => {
+    if (swallowClick) { swallowClick = false; return; }   // 拖动结束的抬手不算点击
+    if (ev.target.closest('.ep-done')) { toggleDone(it); return; }
+    if (row.classList.contains('open')) { setRowOpen(row, false); return; }
+    play(it);
+  });
+}
+
+// 点列表外面（工具栏、播放器）或者滚动列表时，把展开的抽屉收起来
+document.addEventListener('pointerdown', (ev) => {
+  if (openRow && !openRow.contains(ev.target)) setRowOpen(openRow, false);
+}, true);
+$('list').addEventListener('scroll', () => {
+  if (openRow) setRowOpen(openRow, false);
+}, { passive: true });
+
 function rowEl(it) {
   const playing = !!(current && current.id === it.id);
   const row = document.createElement('article');
@@ -801,13 +907,22 @@ function rowEl(it) {
   done.setAttribute('aria-pressed', String(!!it.fin));
   done.title = it.fin ? '取消已完播' : '标记为已完播';
 
-  row.appendChild(cover);
-  row.appendChild(main);
-  row.appendChild(done);
-  row.addEventListener('click', (ev) => {
-    if (ev.target.closest('.ep-done')) { toggleDone(it); return; }
-    play(it);
-  });
+  const drawer = document.createElement('div');
+  drawer.className = 'ep-drawer';
+  drawer.appendChild(done);
+
+  const slide = document.createElement('div');
+  slide.className = 'ep-slide';
+  slide.appendChild(cover);
+  slide.appendChild(main);
+
+  const track = document.createElement('div');
+  track.className = 'ep-track';
+  track.appendChild(slide);
+  track.appendChild(drawer);
+  row.appendChild(track);
+
+  attachRowDrawer(row, it);
   return row;
 }
 
@@ -815,6 +930,7 @@ function render() {
   view = visibleEpisodes();
   rendered = 0;
   bars.clear();
+  openRow = null;   // 整列重建，旧的行引用作废
   const list = $('list');
   list.innerHTML = '';
   list.appendChild(sentinel);   // 哨兵始终留在列表末尾
