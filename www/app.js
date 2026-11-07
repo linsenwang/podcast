@@ -517,10 +517,12 @@ async function loadIndex() {
   const ttsFeed = new URL('tts/feed.xml', document.baseURI).href;
   list.push({ id: 'tts', title: '本地 TTS', xmlUrl: ttsFeed, url: ttsFeed });
 
-  // 外部订阅：列表只在 external-feeds.tsv 里维护，nginx 启动时按它生成反代
-  // （见 gen-external-feeds.sh），客户端也读同一份文件。源站不带 CORS 头，
-  // 所以 feed 走同源反代 /ext/<id>/rss；单集音频是 https 直链，播放不需要 CORS。
-  // 文件拿不到时只是少几个外部源，不能影响 podsync 的订阅。
+  // 外部订阅补充列表：大部分第三方播客已迁到 podsync 的 [[rss]] 配置
+  // （podsync 定时抓取、落成本地 <id>.xml，随 podsync.opml 一起下发），
+  // 这里只留 podsync 处理不了的源。列表在 external-feeds.tsv 里维护，
+  // nginx 启动时按它生成反代（见 gen-external-feeds.sh），客户端也读同一份文件。
+  // 源站不带 CORS 头，所以 feed 走同源反代 /ext/<id>/rss；单集音频是直链，
+  // 播放不需要 CORS。文件拿不到时只是少几个外部源，不能影响 podsync 的订阅。
   try {
     const res = await fetch(new URL('external-feeds.tsv', document.baseURI), { cache: 'no-store' });
     if (res.ok) {
