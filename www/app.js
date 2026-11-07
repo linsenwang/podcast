@@ -1,5 +1,5 @@
 /* 极简播客客户端
- * 数据源：podsync 的 podsync.opml（经同源反代 /feeds/ 读取）
+ * 数据源：/api/feeds.json（服务端把 40+ 个 RSS 解析成精简条目包）
  * 缓存：订阅列表存 localStorage，单集存 IndexedDB
  * 进度：localStorage + 跨设备同步（每台设备一个文件，按条目时间戳合并）
  * 完播 = 播到 98% 以上或手动标记
@@ -7,16 +7,11 @@
 'use strict';
 
 /* ================= 常量 ================= */
-const FEED_BASE = new URL('feeds/', document.baseURI).href; // 同源反代前缀
-const INDEX_URL = FEED_BASE + 'podsync.opml';
+const API_URL = new URL('api/feeds.json', document.baseURI).href; // 服务端打好包的订阅
 const SYNC_BASE = new URL('sync/', document.baseURI).href;  // nginx WebDAV 目录
 const THUMB_BASE = new URL('thumb', document.baseURI).href;  // 服务端缩略图接口
 const COVER_FALLBACK = new URL('icons/icon-192.png', document.baseURI).href; // 没封面时的占位图（PWA 图标）
-const STALE_MS = 15 * 60 * 1000;   // 超过这个时间就重取单个 feed
-const FEED_POOL = 8;               // 平时同时刷新几个 feed
-const FEED_POOL_PLAYING = 1;       // 播放中只留一路：音频优先，刷新源靠边
-const FEED_TIMEOUT_MS = 30000;     // 单个源最多等这么久；长尾源不能一直占着连接
-const FEED_SLOT_POLL = 250;        // 等刷新槽位的轮询间隔
+const REFRESH_TIMEOUT_MS = 45000;   // 整包最多等这么久；服务端回源慢也不能一直挂着
 const SYNC_TIMEOUT_MS = 5000;      // 同步优先级高，但也不能无限等
 const SYNC_BOOT_WAIT_MS = 1500;    // 启动时最多等同步这么久，剩下的转到后台
 const PAGE_SIZE = 60;              // 列表分批渲染，避免一次塞几千个节点
@@ -237,8 +232,7 @@ async function syncPull() {
       .filter((n) => n !== DEVICE_FILE);
     if (!names.length) return;
 
-    // 设备文件都很小，多开几路能明显缩短同步；同步本身又要给刷新源让路，
-    // 所以它自己快一点，整体就少堵一会儿。
+    // 设备文件都很小，多开几路能明显缩短同步，回到前台时少堵一会儿。
     const docs = [];
     await pool(names, 8, async (n) => {
       try {
@@ -345,45 +339,31 @@ async function dbGetAll() {
     });
   } catch (_) { return []; }
 }
-async function dbPut(rec) {
+async function dbPutAll(recs) {
+  if (!recs.length) return;
   try {
     const d = await getDB();
     await new Promise((res, rej) => {
-      const r = d.transaction('feeds', 'readwrite').objectStore('feeds').put(rec);
-      r.onsuccess = () => res();
-      r.onerror = () => rej(r.error);
+      // 整包一次事务写完：40 多个源逐个开事务的话，冷启动要多等几百毫秒
+      const tx = d.transaction('feeds', 'readwrite');
+      const st = tx.objectStore('feeds');
+      for (const r of recs) st.put(r);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
     });
   } catch (_) { /* 缓存写失败不影响播放 */ }
 }
 
 /* ================= 状态 ================= */
-let feeds = [];          // [{id,title,xmlUrl,url,fetchedAt,episodes,error}]
-let backendOrigin = null;
+let feeds = [];          // [{id,title,fetchedAt,episodes,err}]
 let view = [];           // 当前可见条目（已排序）
 let rendered = 0;
 let current = null;      // 正在播放的条目
 let refreshing = false;
-let progressRenderTimer = 0; // 刷新过程中按 feed 逐个重绘的节流句柄
 const bars = new Map();  // 单集 id -> 进度条 <i>
 let openRow = null;      // 右侧抽屉展开着的那一行（同时只允许一行）
 
 /* ================= 小工具 ================= */
-function tagText(root, name) {
-  const n = root.getElementsByTagName(name);
-  return n.length ? (n[0].textContent || '').trim() : '';
-}
-function firstTag(root, name) {
-  const n = root.getElementsByTagName(name);
-  return n.length ? n[0] : null;
-}
-function parseDur(s) {
-  if (!s) return 0;
-  s = String(s).trim();
-  if (/^\d+(\.\d+)?$/.test(s)) return Math.round(parseFloat(s));
-  const p = s.split(':').map(Number);
-  if (p.some((x) => !isFinite(x))) return 0;
-  return p.reduce((a, b) => a * 60 + b, 0);
-}
 function fmtDur(sec) {
   sec = Math.max(0, Math.round(sec || 0));
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
@@ -401,15 +381,11 @@ function fmtDate(ms) {
   const md = p(d.getMonth() + 1) + '-' + p(d.getDate());
   return d.getFullYear() === now.getFullYear() ? md : d.getFullYear() + '-' + md;
 }
-// 把后端绝对地址换成同源反代地址
+// 相对地址（服务端已经改写成 feeds/xxx、/tts/xxx）按页面地址补全，
+// 外部源的绝对地址原样保留
 function toLocal(u) {
   if (!u) return '';
-  let abs;
-  try { abs = new URL(u, document.baseURI); } catch (_) { return u; }
-  if (backendOrigin && abs.origin === backendOrigin) {
-    return FEED_BASE + abs.pathname.replace(/^\//, '') + abs.search;
-  }
-  return abs.href;
+  try { return new URL(u, document.baseURI).href; } catch (_) { return u; }
 }
 // 封面图：远端的 http 图在 HTTPS 页面会被当混合内容拦掉，统一升到 https
 // （hdslb 的 https 是通的，只认 Referer；referrer 策略见 index.html）
@@ -453,94 +429,6 @@ function setStatus(s) {
   }, STATUS_TTL);
 }
 
-/* ================= 解析 ================= */
-function parseFeed(xml) {
-  const doc = new DOMParser().parseFromString(xml, 'text/xml');
-  const channel = firstTag(doc, 'channel') || doc.documentElement;
-  const imgEl = firstTag(channel, 'image');
-  const itunesImg = firstTag(channel, 'itunes:image');
-  const feedImg = imgEl ? tagText(imgEl, 'url') : (itunesImg ? itunesImg.getAttribute('href') : '');
-
-  const items = doc.getElementsByTagName('item');
-  const out = [];
-  const seen = new Set();
-
-  for (let i = 0; i < items.length; i++) {
-    const it = items[i];
-    const enc = firstTag(it, 'enclosure');
-    const url = enc ? enc.getAttribute('url') : '';
-    if (!url) continue;
-
-    const guid = tagText(it, 'guid') || url;
-    if (seen.has(guid)) continue;
-    seen.add(guid);
-
-    const dateStr = tagText(it, 'pubDate') || tagText(it, 'date');
-    const ts = dateStr ? Date.parse(dateStr) : NaN;
-    const img = firstTag(it, 'itunes:image');
-
-    out.push({
-      g: guid,
-      t: tagText(it, 'title') || '(无标题)',
-      p: isFinite(ts) ? ts : 0,
-      u: url,
-      d: parseDur(tagText(it, 'itunes:duration')),
-      i: (img && img.getAttribute('href')) || feedImg,
-    });
-  }
-  out.sort((a, b) => b.p - a.p); // 单集按时间倒序，"播完接下一集"依赖这个
-  return out;
-}
-
-async function loadIndex() {
-  const res = await fetch(INDEX_URL, { cache: 'no-store' });
-  if (!res.ok) throw new Error('OPML HTTP ' + res.status);
-  const doc = new DOMParser().parseFromString(await res.text(), 'text/xml');
-  const nodes = doc.getElementsByTagName('outline');
-  const list = [];
-  for (let i = 0; i < nodes.length; i++) {
-    const xmlUrl = nodes[i].getAttribute('xmlUrl');
-    if (!xmlUrl) continue;
-    let abs;
-    try { abs = new URL(xmlUrl, document.baseURI); } catch (_) { continue; }
-    if (!backendOrigin) backendOrigin = abs.origin;
-    list.push({
-      id: abs.pathname.split('/').pop().replace(/\.xml$/i, ''),
-      title: nodes[i].getAttribute('title') || nodes[i].getAttribute('text') || '',
-      xmlUrl: xmlUrl,
-      url: toLocal(xmlUrl),
-    });
-  }
-  // 本地 TTS 音频（index-tts 生成）：不在 podsync 的 opml 里，这里补一条。
-  // feed 和音频都由 podcast 的 nginx 同源提供（见 nginx.conf 的 /tts/），
-  // 服务没起来时只是这一项刷新失败，不影响其他订阅。
-  const ttsFeed = new URL('tts/feed.xml', document.baseURI).href;
-  list.push({ id: 'tts', title: '本地 TTS', xmlUrl: ttsFeed, url: ttsFeed });
-
-  // 外部订阅补充列表：大部分第三方播客已迁到 podsync 的 [[rss]] 配置
-  // （podsync 定时抓取、落成本地 <id>.xml，随 podsync.opml 一起下发），
-  // 这里只留 podsync 处理不了的源。列表在 external-feeds.tsv 里维护，
-  // nginx 启动时按它生成反代（见 gen-external-feeds.sh），客户端也读同一份文件。
-  // 源站不带 CORS 头，所以 feed 走同源反代 /ext/<id>/rss；单集音频是直链，
-  // 播放不需要 CORS。文件拿不到时只是少几个外部源，不能影响 podsync 的订阅。
-  try {
-    const res = await fetch(new URL('external-feeds.tsv', document.baseURI), { cache: 'no-store' });
-    if (res.ok) {
-      for (const raw of (await res.text()).split('\n')) {
-        const line = raw.replace(/\r$/, '');
-        if (!line.trim() || line.trim().startsWith('#')) continue;
-        const cols = line.split('\t');
-        const id = (cols[0] || '').trim();
-        if (!/^[a-z0-9_-]+$/.test(id)) continue;
-        const title = (cols[1] || id).trim();
-        const u = new URL('ext/' + id + '/rss', document.baseURI).href;
-        list.push({ id: id, title: title, xmlUrl: u, url: u });
-      }
-    }
-  } catch (_) { /* 外部列表不可用不影响主流程 */ }
-  return list;
-}
-
 /* ================= 拉取与刷新 ================= */
 async function pool(items, limit, fn) {
   let idx = 0;
@@ -550,148 +438,99 @@ async function pool(items, limit, fn) {
   await Promise.all(workers);
 }
 
-/* 刷新源的网络闸门：同步和播放优先。
- * 平时 8 路并发；正在从其它设备同步（pulling）或用户想播放（wantPlay）时
- * 只留 1 路，把连接和带宽让给它们。
- * 已经在跑的 feed 请求由 holdFeedsForPlayback() 当场撤掉，不用等它自己超时 ——
- * 长尾源最占连接，正是它会把音频起播堵在后面。
- */
-let feedActive = 0;
-const feedControllers = new Set();
+// 刷新整包：服务端已经把 40+ 个 RSS 解析好，这里一次拿完。
+// 用户主动刷新用 no-store 确保回源；启动/自动刷新用 no-cache + ETag，
+// 没有新单集时只收一个 304，在 Tailscale 网络差的时候又快一截。
+async function loadBundle(force, signal) {
+  const url = API_URL + (force ? '?refresh=1' : '');
+  const res = await fetch(url, { cache: force ? 'no-store' : 'no-cache', signal });
+  if (res.status === 304) return null;   // 理论上 fetch 会直接用本地缓存，兜个底
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const data = await res.json();
+  if (!data || !Array.isArray(data.feeds)) throw new Error('订阅包格式不对');
+  return data;
+}
 
-function feedLimit() { return (wantPlay || pulling) ? FEED_POOL_PLAYING : FEED_POOL; }
-
+// 播放优先：刷新整包只有一次请求，正在下载时直接撤掉，把连接让给音频。
+let refreshCtrl = null;
 function holdFeedsForPlayback() {
-  if (!feedControllers.size) return;
-  for (const c of feedControllers) {
-    try { c.abort(); } catch (_) {}
-  }
-  feedControllers.clear();
+  if (!refreshCtrl) return;
+  try { refreshCtrl.abort(); } catch (_) {}
 }
 
-async function acquireFeedSlot() {
-  while (feedActive >= feedLimit()) {
-    await delay(FEED_SLOT_POLL);
-  }
-  feedActive++;
-}
-function releaseFeedSlot() {
-  if (feedActive > 0) feedActive--;
-}
-
-// 刷新单个源。返回 'updated' / 'ok' / 'unchanged'（304）/ 'failed' / 'deferred'。
-// 每个源用自己的 AbortController：既能在超时后放弃长尾源，
-// 也能在用户点播放时被 holdFeedsForPlayback() 立即撤掉。
-async function refreshFeed(f) {
-  await acquireFeedSlot();
-  let timedOut = false;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => {
-    timedOut = true;
-    try { ctrl.abort(); } catch (_) {}
-  }, FEED_TIMEOUT_MS);
-  feedControllers.add(ctrl);
-
-  try {
-    // feed 大部分时候没变，带上 If-Modified-Since 就能只收一个 304 ——
-    // 不但省掉整个体的下载，连 DOMParser 和重建对象都省了
-    const headers = {};
-    if (f.lastModified && f.episodes.length) headers['If-Modified-Since'] = f.lastModified;
-
-    const res = await fetch(f.url, { cache: 'no-store', headers: headers, signal: ctrl.signal });
-    if (res.status === 304) {
-      f.fetchedAt = Date.now();
-      f.error = '';
-      await dbPut({
-        id: f.id, fetchedAt: f.fetchedAt, lastModified: f.lastModified, episodes: f.episodes,
-      });
-      return 'unchanged';
-    }
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-
-    // 上游经常回 200 但内容没变，逐个比较 guid 才知道到底有没有新单集
-    const seen = new Set(f.episodes.map((e) => e.g || e.u));
-    const episodes = parseFeed(await res.text());
-    const updated = episodes.some((e) => !seen.has(e.g || e.u));
-    f.episodes = episodes;
-    f.fetchedAt = Date.now();
-    f.lastModified = res.headers.get('Last-Modified') || f.lastModified || '';
-    f.error = '';
-    await dbPut({
-      id: f.id, fetchedAt: f.fetchedAt, lastModified: f.lastModified, episodes: f.episodes,
-    });
-    if (updated) renderSoon();   // 有更新就立刻让它冒出来，不等其它源
-    return updated ? 'updated' : 'ok';
-  } catch (err) {
-    if (err && err.name === 'AbortError') {
-      if (timedOut) {
-        f.error = '超时';
-        return 'failed';
-      }
-      // 给播放让路：不算失败，保留旧数据，排到下次刷新再补
-      return 'deferred';
-    }
-    f.error = String((err && err.message) || err);
-    return 'failed';
-  } finally {
-    clearTimeout(timer);
-    feedControllers.delete(ctrl);
-    releaseFeedSlot();
-  }
+function countNew(oldEps, newEps) {
+  if (!oldEps || !oldEps.length) return newEps.length;
+  const seen = new Set(oldEps.map((e) => e.g || e.u));
+  let n = 0;
+  for (const e of newEps) if (!seen.has(e.g || e.u)) n++;
+  return n;
 }
 
 async function refresh(force) {
   if (refreshing) return;
   refreshing = true;
   $('refresh').disabled = true;
+  const ctrl = new AbortController();
+  refreshCtrl = ctrl;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { ctrl.abort(); } catch (_) {}
+  }, REFRESH_TIMEOUT_MS);
+
   try {
-    setStatus('读取订阅列表…');
-    const index = await loadIndex();
+    setStatus(force ? '更新订阅…' : '读取订阅…');
+    const bundle = await loadBundle(force, ctrl.signal);
+    if (!bundle) return;   // 304：本地数据已经是最新的
 
-    // 缓存里的单集先留着，切换后立刻能显示
-    const cached = new Map((await dbGetAll()).map((r) => [r.id, r]));
-    feeds = index.map((f) => {
-      const c = cached.get(f.id);
-      return Object.assign({}, f, {
-        fetchedAt: c ? c.fetchedAt : 0,
-        lastModified: c && c.lastModified ? c.lastModified : '',
-        episodes: c && c.episodes ? c.episodes : [],
+    const cached = new Map(feeds.map((f) => [f.id, f]));
+    const at = Date.now();
+    const next = [];
+    let failed = 0, fresh = 0;
+
+    for (const raw of bundle.feeds) {
+      if (!raw || !raw.id) continue;
+      const old = cached.get(raw.id);
+      const list = Array.isArray(raw.episodes) ? raw.episodes : [];
+      if (raw.err) failed++;
+      // 服务端这次没抓到源时会把上次的条目带回来；万一它连磁盘缓存都没有，
+      // 先保留本地 IndexedDB 里的旧数据，别因为一次上游故障把列表清空。
+      const episodes = (!list.length && old && old.episodes.length) ? old.episodes : list;
+      fresh += countNew(old && old.episodes, episodes);
+      next.push({
+        id: raw.id,
+        title: raw.title || raw.id,
+        fetchedAt: at,
+        episodes: episodes,
+        err: raw.err || '',
       });
-    });
-    writeLS(LS_INDEX, { backendOrigin: backendOrigin, feeds: index });
+    }
+    if (!next.length) throw new Error('订阅包为空');
+
+    feeds = next;
+    await dbPutAll(next.map((f) => ({
+      id: f.id, fetchedAt: f.fetchedAt, episodes: f.episodes,
+    })));
+    writeLS(LS_INDEX, { feeds: next.map((f) => ({ id: f.id, title: f.title })) });
     syncFeedSelect();
-    render();
 
-    const stale = feeds.filter((f) => force || Date.now() - f.fetchedAt > STALE_MS);
-    let done = 0, failed = 0, unchanged = 0, deferred = 0;
-    // 仍是 8 个 worker：真正同时发几个请求由 acquireFeedSlot() 按播放状态决定。
-    // 播放开始后多出来的 worker 会等在槽位上，暂停后立刻续上。
-    const queue = stale.slice();
-    let next = 0;
-    await Promise.all(new Array(Math.min(FEED_POOL, queue.length)).fill(0).map(async () => {
-      while (next < queue.length) {
-        const kind = await refreshFeed(queue[next++]);
-        if (kind === 'deferred') { deferred++; continue; }
-        done++;
-        if (kind === 'failed') failed++;
-        else if (kind === 'unchanged') unchanged++;
-        setStatus('更新 ' + done + '/' + stale.length);
-      }
-    }));
-
-    clearTimeout(progressRenderTimer);
-    progressRenderTimer = 0;
     pruneProgress();
     render();
+
     const stamp = new Date().toTimeString().slice(0, 5);
-    const yieldNote = deferred ? '，' + deferred + ' 个源让位给播放' : '';
-    if (failed) setStatus(stamp + ' 更新完成，' + failed + ' 个失败' + yieldNote);
-    else if (deferred) setStatus(stamp + ' 已更新' + yieldNote + '，下次再补');
-    else if (unchanged) setStatus(stamp + ' 已更新（' + unchanged + ' 个未变化）');
+    if (failed) setStatus(stamp + ' 更新完成，' + failed + ' 个源失败');
+    else if (fresh) setStatus(stamp + ' 已更新，' + fresh + ' 个新单集');
     else setStatus(stamp + ' 已更新');
   } catch (err) {
-    setStatus('离线：' + String((err && err.message) || err));
+    if (err && err.name === 'AbortError') {
+      // 让位给播放，或者超过 REFRESH_TIMEOUT_MS：旧数据不动，下次再补
+      setStatus(timedOut ? '更新超时，稍后再试' : '更新已暂停，优先播放');
+    } else {
+      setStatus('离线：' + String((err && err.message) || err));
+    }
   } finally {
+    clearTimeout(timer);
+    if (refreshCtrl === ctrl) refreshCtrl = null;
     refreshing = false;
     $('refresh').disabled = false;
   }
@@ -953,24 +792,6 @@ function render() {
   }
 }
 
-// 刷新过程中每完成一个 feed 就重绘一次：30+ 个源是并发拉的，等全部结束再
-// 一次性出结果要空转十几秒。节流到 300ms，既不会每个 feed 都重建整张列表，
-// 又能看到单集陆续冒出来。重绘会重建 DOM，先把滚动位置记下来再放回去。
-function renderSoon() {
-  if (progressRenderTimer) return;
-  progressRenderTimer = setTimeout(() => {
-    progressRenderTimer = 0;
-    renderKeepScroll();
-  }, 300);
-}
-
-function renderKeepScroll() {
-  const list = $('list');
-  const top = list.scrollTop;
-  render();
-  list.scrollTop = top;
-}
-
 function renderMore() {
   if (rendered >= view.length) return;
   const end = Math.min(rendered + PAGE_SIZE, view.length);
@@ -1198,8 +1019,8 @@ function maybeWrapped(from, to) {
 // audio session 和缓冲，在 iOS 后台反而更容易把播放掐断。
 function reloadAt(pos, hard) {
   if (!current) return;
-  wantPlay = true;                 // 重新拉流期间刷新源保持在 1 路
-  holdFeedsForPlayback();          // 正在跑的 feed 请求当场让路
+  wantPlay = true;                 // 音频优先，刷新包别再来抢连接
+  holdFeedsForPlayback();          // 正在下载的条目包当场撤掉
   clearPlayWatchdog();
   cancelResume();
   pendingSeek = pos > 0 ? pos : null;
@@ -1228,7 +1049,7 @@ function requestPlay() {
   armAudioSession();                   // 必须在手势里、play() 之前
   cancelResume();                      // 用户/系统主动操作了，撤掉待执行的自动重试
   wantPlay = true;
-  holdFeedsForPlayback();              // 音频要起播，正在刷新的源先让路
+  holdFeedsForPlayback();              // 音频要起播，正在下载的条目包先让路
   audio.loop = true;                   // 任何路径都不要让元素自然 ended
   audio.playbackRate = settings.speed;
   const at = currentPosition() || savedPosition(current);
@@ -1715,8 +1536,8 @@ function play(it) {
   // 暂停请用播放器上的按钮。
   if (same && wantPlay) { requestPlay(); return; }
 
-  wantPlay = true;                         // 先把刷新源降到 1 路
-  holdFeedsForPlayback();                  // 正在跑的 feed 请求当场让路，别跟音频抢连接
+  wantPlay = true;                         // 音频优先，刷新包别再来抢连接
+  holdFeedsForPlayback();                  // 正在下载的条目包当场撤掉
   armAudioSession();                       // 必须在用户手势里、动音源之前
   cancelResume();                          // 用户自己操作了，撤掉待执行的自动重试
   clearPlayWatchdog();                     // 上一次尝试的兜底定时器作废
@@ -2210,15 +2031,13 @@ async function boot() {
   const cachedIndex = readLS(LS_INDEX, null);
   const hasCache = !!(cachedIndex && cachedIndex.feeds && cachedIndex.feeds.length);
   if (hasCache) {
-    backendOrigin = cachedIndex.backendOrigin || null;
-    feeds = cachedIndex.feeds.map((f) => Object.assign({}, f, { episodes: [], fetchedAt: 0 }));
+    feeds = cachedIndex.feeds.map((f) => Object.assign({}, f, { episodes: [], fetchedAt: 0, err: '' }));
     const cached = new Map((await dbGetAll()).map((r) => [r.id, r]));
     for (const f of feeds) {
       const c = cached.get(f.id);
       if (c) {
         f.episodes = c.episodes || [];
         f.fetchedAt = c.fetchedAt || 0;
-        f.lastModified = c.lastModified || '';
       }
     }
     syncFeedSelect();
@@ -2229,7 +2048,6 @@ async function boot() {
   restorePlayer();
 
   // 同步优先，但启动只等一小会儿：拿到最新进度就够，慢的部分转到后台。
-  // 它继续跑的同时 pulling 仍会让刷新源保持 1 路，所以优先级不丢。
   await Promise.race([syncPull(), delay(SYNC_BOOT_WAIT_MS)]);
   await refresh(!hasCache);
   syncFeedSelect();

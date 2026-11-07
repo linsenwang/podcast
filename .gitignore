@@ -5,3 +5,11 @@ sync/*.json
 # 只是把 .gitkeep 留下，免得目录不存在时 bind mount 被 docker 建成 root 属主。
 thumbs/cache/*
 !thumbs/cache/.gitkeep
+
+# 订阅打包服务的磁盘缓存：同样能从 RSS 重新生成，只留 .gitkeep 占住目录
+feeds/cache/*
+!feeds/cache/.gitkeep
+
+# 本地调试/导入 Python 模块时生成的字节码
+__pycache__/
+*.pyc
