@@ -12,7 +12,7 @@ const SYNC_BASE = new URL('sync/', document.baseURI).href;  // nginx WebDAV 目�
 const THUMB_BASE = new URL('thumb', document.baseURI).href;  // 服务端缩略图接口
 const COVER_FALLBACK = new URL('icons/icon-192.png', document.baseURI).href; // 没封面时的占位图（PWA 图标）
 const REFRESH_TIMEOUT_MS = 45000;   // 整包最多等这么久；服务端回源慢也不能一直挂着
-const SYNC_TIMEOUT_MS = 5000;      // 同步优先级高，但也不能无限等
+const SYNC_TIMEOUT_MS = 15000;     // 单个同步请求的上限；网络差时 5 秒容易把设备文件截断
 const SYNC_BOOT_WAIT_MS = 1500;    // 启动时最多等同步这么久，剩下的转到后台
 const PAGE_SIZE = 60;              // 列表分批渲染，避免一次塞几千个节点
 const DONE_RATIO = 0.98;           // 播到这里就算完播
@@ -32,6 +32,7 @@ const LS_DEVICE = 'podcast.device';
 const LS_SETTINGS_AT = 'podcast.settingsAt';
 const LS_SETTINGS_V = 'podcast.settingsV';
 const LS_LAMPORT = 'podcast.lamport';
+const LS_SYNC_SEEN = 'podcast.syncSeen'; // 已同步到的设备文件 mtime，下次只拉更新的
 
 const $ = (id) => document.getElementById(id);
 const sentinel = $('sentinel');
@@ -148,6 +149,7 @@ let pushTimer = 0;
 let pushDueAt = 0;
 let lastPull = 0;
 let syncBroken = false;
+let syncSeen = Number(readLS(LS_SYNC_SEEN, 0)) || 0;
 
 function syncPayload() {
   return {
@@ -210,6 +212,8 @@ function markSyncBroken(err) {
   setStatus('同步不可用：' + ((err && err.message) || err));
 }
 
+// 设备文件按 mtime 从新到旧拉：最新的进度通常就在最近更新的那台设备上，
+// 先拉先合并。网络差时不用等几十个文件全部下完才看到断点。
 async function syncPull() {
   if (pulling) return;                 // 启动和回到前台可能同时触发，别拉两遍
   pulling = true;
@@ -226,21 +230,41 @@ async function syncPull() {
       return;
     }
 
-    const names = (Array.isArray(list) ? list : [])
+    const files = (Array.isArray(list) ? list : [])
       .filter((f) => f && f.type === 'file' && /^dev-[a-z0-9]+\.json$/.test(f.name))
-      .map((f) => f.name)
-      .filter((n) => n !== DEVICE_FILE);
-    if (!names.length) return;
+      .map((f) => ({ name: f.name, mtime: Date.parse(f.mtime) || 0 }))
+      .filter((f) => f.name !== DEVICE_FILE);
+    if (!files.length) return;
 
-    // 设备文件都很小，多开几路能明显缩短同步，回到前台时少堵一会儿。
-    const docs = [];
-    await pool(names, 8, async (n) => {
-      try {
-        const r = await fetchSync(SYNC_BASE + n, { cache: 'no-store' });
-        if (r.ok) docs.push(await r.json());
-      } catch (_) { /* 单个设备文件坏了不影响其它 */ }
-    });
-    mergeDocs(docs);
+    // 只拉上次同步之后变过的文件；第一次同步（syncSeen=0）还是全量。
+    // 用严格大于：mtime 与水位相同的就是已经拿过的那份。
+    const todo = files.filter((f) => !syncSeen || f.mtime > syncSeen);
+    todo.sort((a, b) => b.mtime - a.mtime);
+
+    let failed = false;
+    // 每 8 个文件合并一次：第一批通常就是最近更新的设备，断点能先出来。
+    // mergeDocs 是幂等的，同一个文件重复合并不会产生额外版本。
+    for (let i = 0; i < todo.length; i += 8) {
+      const batch = todo.slice(i, i + 8);
+      const docs = [];
+      await pool(batch, 8, async (f) => {
+        try {
+          const r = await fetchSync(SYNC_BASE + f.name, { cache: 'no-store' });
+          if (r.ok) docs.push(await r.json());
+          else failed = true;
+        } catch (_) { failed = true; }
+      });
+      if (docs.length) mergeDocs(docs);
+    }
+
+    // 全部成功才推进水位；有失败就下次重拉，别把没拿到的文件跳过。
+    if (!failed) {
+      const newest = files.reduce((m, f) => Math.max(m, f.mtime), 0);
+      if (newest > syncSeen) {
+        syncSeen = newest;
+        writeLS(LS_SYNC_SEEN, syncSeen);
+      }
+    }
   } finally {
     pulling = false;
   }
